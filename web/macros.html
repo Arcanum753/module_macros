@@ -104,85 +104,85 @@
                     <li><code>a,b,c</code> — список значений;</li>
                     <li><code>?</code> — то же, что <code>*</code>.</li>
                 </ul>
-                <p style="margin:4px 0;"><b>Примеры правил в сценарии:</b></p>
-                <pre style="margin:4px 0; background:#f6f6f6; padding:4px;">cron {*/10 * * * * *} { ... }    # каждые 10 секунд
-cron {0 * * * * *}     { ... }    # каждая минута (в 0-ю секунду)
-cron {15 42 * * * *}   { ... }    # каждый час в 00:42:15
-cron {0 0 9 * * 1-5}   { ... }    # будни в 09:00:00
-cron {30 6 1 * *}      { ... }    # 1-го числа каждого месяца в 06:00:30
+                <p style="margin:4px 0;"><b>Примеры выражений</b> (вставляются в правило
+                <code>cron("&lt;выражение&gt;", function() … end)</code>):</p>
+                <pre style="margin:4px 0; background:#f6f6f6; padding:4px;">*/10 * * * * *    # каждые 10 секунд
+0 * * * * *     # каждая минута (в 0-ю секунду)
+15 42 * * * *   # каждый час в 00:42:15
+0 0 9 * * 1-5   # будни в 09:00:00
+30 6 1 * *      # 1-го числа каждого месяца в 06:00:30
 # --- по часам и «раз в N часов» ---
-cron {0 0 * * * *}     { ... }    # каждый час в 00:00:00
-cron {0 0 */2 * * *}   { ... }    # каждые 2 часа (00:00, 02:00, 04:00, ...)
-cron {0 30 */4 * * *}  { ... }    # каждые 4 часа в :30 (00:30, 04:30, ...)
+0 0 * * * *     # каждый час в 00:00:00
+0 0 */2 * * *   # каждые 2 часа (00:00, 02:00, 04:00, ...)
+0 30 */4 * * *  # каждые 4 часа в :30 (00:30, 04:30, ...)
 # --- по дням недели (0 = воскресенье, 1 = понедельник, ...) ---
-cron {0 0 9 * * 1}     { ... }    # по понедельникам в 09:00
-cron {0 0 9 * * 1,2,4} { ... }    # по понедельникам, вторникам и четвергам в 09:00
-cron {0 0 9 * * 1-5}   { ... }    # по будням (пн-пт) в 09:00
+0 0 9 * * 1     # по понедельникам в 09:00
+0 0 9 * * 1,2,4 # по понедельникам, вторникам и четвергам в 09:00
+0 0 9 * * 1-5   # по будням (пн-пт) в 09:00
 # --- по числам месяца ---
-cron {0 0 9 2-30/2 * *} { ... }   # чётные числа месяца в 09:00
-cron {0 0 9 1-31/2 * *} { ... }   # нечётные числа месяца в 09:00
-cron {0 0 9 5 * *}     { ... }    # 5-го числа каждого месяца в 09:00
-cron {0 0 9 */5 * *}   { ... }    # каждое 5-е число (1,6,11,...) в 09:00
+0 0 9 2-30/2 * *  # чётные числа месяца в 09:00
+0 0 9 1-31/2 * *  # нечётные числа месяца в 09:00
+0 0 9 5 * *     # 5-го числа каждого месяца в 09:00
+0 0 9 */5 * *   # каждое 5-е число (1,6,11,...) в 09:00
 # --- диапазон времени (например, с 9 до 17 часов) ---
-cron {0 0 9-17 * * *}  { ... }    # каждый час с 09:00 до 17:00 включительно
-cron {0 30 9-17 * * *} { ... }    # каждый час в :30 с 09:30 до 17:30
-cron {0 0 9-17 * * 1-5} { ... }   # будни, каждый час с 09:00 до 17:00</pre>
+0 0 9-17 * * *  # каждый час с 09:00 до 17:00 включительно
+0 30 9-17 * * * # каждый час в :30 с 09:30 до 17:30
+0 0 9-17 * * 1-5  # будни, каждый час с 09:00 до 17:00</pre>
                 <p style="margin:4px 0;">
                     Cron срабатывает только после синхронизации времени по NTP; выражения
                     считаются в локальном времени устройства. Готовые примеры — файлы
-                    <code>ex_10s.tcl</code>, <code>ex_1m.tcl</code>, <code>ex_minsec.tcl</code>.
+                    <code>ex_10s.lua</code>, <code>ex_1m.lua</code>, <code>ex_minsec.lua</code>.
                 </p>
             </div>
         </details>
 
         <details style="text-align:left; margin:10px auto 0; max-width:740px;">
-            <summary style="cursor:pointer; font-weight:bold; color:#444;">Справка: язык сценариев (Tcl)</summary>
+            <summary style="cursor:pointer; font-weight:bold; color:#444;">Справка: язык сценариев (Lua)</summary>
             <div style="margin:6px 0 0 4px; font-size:13px; line-height:1.5;">
-                <p style="margin:4px 0;">Файл <code>/macros/&lt;имя&gt;.tcl</code> — это сценарий на Tcl.
+                <p style="margin:4px 0;">Файл <code>/macros/&lt;имя&gt;.lua</code> — это сценарий на Lua.
                 Правила регистрируются при запуске/перечитывании файла; остановленный сценарий не исполняется.
-                Все правила файла работают в одном интерпретаторе (переменные и <code>proc</code> общие).</p>
+                Все правила файла работают в одном интерпретаторе (переменные и функции общие).</p>
 
-                <p style="margin:6px 0 2px 0;"><b>Регистрация правил (команды верхнего уровня):</b></p>
+                <p style="margin:6px 0 2px 0;"><b>Регистрация правил (вызовы на верхнем уровне):</b></p>
                 <ul style="margin:4px 0 4px 20px; padding:0;">
-                    <li><code>cron {выражение} {тело}</code> — по расписанию (см. справку CRON);</li>
-                    <li><code>cond {условие} {тело}</code> — выполняется при переходе условия
-                        «ложь → истина» (проверка раз в секунду);</li>
-                    <li><code>button {имя} {тело}</code> — внешний вызов: <code>macro btn имя</code>;</li>
-                    <li><code>term {слова...} {тело}</code> — сообщение из терминала:
+                    <li><code>cron("выражение", function() … end)</code> — по расписанию (см. справку CRON);</li>
+                    <li><code>cond(function() return условие end, function() … end)</code> — при переходе
+                        условия «ложь → истина» (проверка раз в секунду);</li>
+                    <li><code>button("имя", function() … end)</code> — внешний вызов: <code>macro btn имя</code>;</li>
+                    <li><code>term("слова...", function() … end)</code> — сообщение из терминала:
                         <code>macro msg слова...</code> (совпадение по всем словам).</li>
                 </ul>
 
-                <p style="margin:6px 0 2px 0;"><b>Команды и значения:</b></p>
+                <p style="margin:6px 0 2px 0;"><b>Доступные функции и значения:</b></p>
                 <ul style="margin:4px 0 4px 20px; padding:0;">
-                    <li><code>set имя значение</code> и обращение <code>$имя</code>;</li>
-                    <li><code>proc имя {аргументы...} {тело}</code> — свои функции;</li>
-                    <li><code>if</code>, <code>while</code>, <code>return</code>, <code>break</code>, <code>continue</code>;</li>
-                    <li><code>puts текст</code> — печать в терминал с префиксом <code>[MACRO]</code>;</li>
-                    <li><code>now</code> — текущие секунды; <code>clock</code> — время «ЧЧ:ММ:СС»;</li>
-                    <li>арифметика и сравнения: <code>+ - * /</code>, <code>&gt; &gt;= &lt; &lt;= == !=</code>;</li>
-                    <li><code>[команда]</code> — подстановка результата, <code>{...}</code> — группировка
-                        без подстановки, <code>"..."</code> — с подстановкой, <code>#</code> — комментарий до конца строки.</li>
+                    <li><code>puts(...)</code> / <code>print(...)</code> — печать в терминал с префиксом <code>[MACRO]</code>;</li>
+                    <li><code>now()</code> — текущие секунды; <code>clock()</code> — время «ЧЧ:ММ:СС»;</li>
+                    <li>обычный Lua: локальные/глобальные переменные, <code>if/while/for</code>,
+                        таблицы, арифметика и сравнения, конкатенация <code>..</code>, замыкания
+                        (стандартные библиотеки <code>string</code>/<code>math</code>/<code>table</code>
+                        отключены от сборки ради размера прошивки).</li>
                 </ul>
 
                 <p style="margin:6px 0 2px 0;"><b>Простой пример сценария:</b></p>
-                <pre style="margin:4px 0; background:#f6f6f6; padding:4px;"># считаем и выводим тики каждые 10 секунд
-set ticks 0
+                <pre style="margin:4px 0; background:#f6f6f6; padding:4px;">-- считаем и выводим тики каждые 10 секунд
+local ticks = 0
 
-proc say {msg} {
-    puts [clock]
-    puts $msg
-}
+local function say(msg)
+    puts(clock())
+    puts(msg)
+end
 
-cron {*/10 * * * * *} {
-    set ticks [+ $ticks 1]
-    say {fired: every 10 seconds}
-}
+cron("*/10 * * * * *", function()
+    ticks = ticks + 1
+    say("fired: every 10 seconds")
+end)
 
-cond {[&gt;= $ticks 6]} {
-    say {fired: already 6 ticks}
-}</pre>
-                <p style="margin:4px 0;">Условие считается истинным, если результат не равен 0.
-                Полный пример правил ввода — файл <code>ex_input.tcl</code>.</p>
+cond(function() return ticks &gt;= 6 end, function()
+    say("fired: already 6 ticks")
+end)</pre>
+                <p style="margin:4px 0;">Условие считается истинным, если функция вернула не
+                <code>false</code>/<code>nil</code>. Полный пример правил ввода — файл
+                <code>ex_input.lua</code>.</p>
             </div>
         </details>
     </div>
@@ -514,7 +514,7 @@ cond {[&gt;= $ticks 6]} {
             }
         }
         async function actCreate() {
-            const r = await api('/macros/create', { name: 'new_macros.tcl' });
+            const r = await api('/macros/create', { name: 'new_macros.lua' });
             await afterPost(r);
         }
         function startRename() {

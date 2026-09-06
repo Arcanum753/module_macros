@@ -1,6 +1,6 @@
 // ============================================================
 // module_macros_engine.cpp — исполнительная машина сценариев
-// (pTcl-интерпретатор + cron + таблица сущностей)
+// (интерпретатор Lua 5.4 через EspLuaEngine + cron + таблица сущностей)
 // ============================================================
 
 #include "module_macros.h"
@@ -9,146 +9,261 @@
 #include "common/TimeLib.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <new>
 
-// Форвард-объявления, необходимые до определений ниже
-static int macroEvalChunks(struct tcl* t, const String& src, String* errOut);
+// Единый счётчик VM-инструкций для защиты от «зависаний» сценария.
+// Безопасен, т.к. интерпретаторы исполняются строго последовательно
+// в main-loop (разбор в тике/begin, тела в тике и событиях).
+static uint32_t macroLuaSteps = 0;
 
-// Вспомогательные функции движка определены в extern "C"-блоке ниже
-extern "C" {
-static String tclValueToString(tcl_value_t* v);
-static void macroTclRegisterExtras(struct tcl* t, void* ctx);
-}
+// Форвард-объявления вспомогательных функций Lua-движка
+static void macroLuaHook(lua_State* L, lua_Debug* ar);
+static String macroLuaPopError(lua_State* L);
+static int macroLuaRunChunk(MacroFile& f, const String& content);
+static int macroLuaRegisterEntity(lua_State* L, uint8_t type);
+static int macroLuaRegCron(lua_State* L);
+static int macroLuaRegCond(lua_State* L);
+static int macroLuaRegTerm(lua_State* L);
+static int macroLuaRegButton(lua_State* L);
+static int macroLuaPuts(lua_State* L);
+static int macroLuaNow(lua_State* L);
+static int macroLuaClock(lua_State* L);
 
 // ============================================================
 // Движок сценариев
 // ============================================================
 
-// Обёртка для tcl.c: исполнение скрипта в интерпретаторе через проверенный
-// C++-вариант построчной разбивки (используется для тел пользовательских proc)
-/** Выполняет Tcl-скрипт по командам верхнего уровня (используется tcl.c для тел proc).
- \param t интерпретатор pTcl
- \param src null-терминированный текст сценария
- \return FNORMAL при успехе либо код потока управления/FERROR
+// Защитный hook: вызывается Lua каждые MACRO_LUA_HOOK_N инструкций VM.
+/** Счётчик инструкций Lua для прерывания «зависших» сценариев.
+  При превышении MACRO_LUA_MAX_OPS поднимает ошибку (обрабатывается pcall).
+ \param L состояние
+ \param ar отладочная информация (не используется)
  */
-
-extern "C" int macroTclEvalScript(struct tcl* t, const char* src) {
-    if (t == NULL || src == NULL) { return FERROR; }
-    String s(src);
-    return macroEvalChunks(t, s, NULL);
+static void macroLuaHook(lua_State* L, lua_Debug* ar) {
+    (void)ar;
+    macroLuaSteps += MACRO_LUA_HOOK_N;
+    if (macroLuaSteps >= MACRO_LUA_MAX_OPS) {
+        luaL_error(L, "scenario step limit exceeded (%d ops)", MACRO_LUA_MAX_OPS);
+    }
 }
 
-// Выполнение Tcl-кода по командам: pTcl надёжно обрабатывает несколько команд
-// только при поочерёдном вызове, поэтому скрипт режем на команды уровня 0
-// (с учётом {} , [] , "" и комментариев #) и исполняем каждую отдельно
-// в том же интерпретаторе (процедуры/переменные сохраняются между вызовами).
-/** Проверяет, что строка состоит только из пробелов/табуляций (начало команды перед комментарием).
- \param s проверяемая строка
- \return true — только пробелы
+/** Забирает текст ошибки Lua с вершины стека и очищает стек.
+ \param L состояние
+ \return текст ошибки (может быть пустым)
  */
-static bool macroWsOnly(const String& s) {
-    for (uint8_t i = 0; i < s.length(); i++) {
-        char c = s.charAt(i);
-        if (c != ' ' && c != '\t') { return false; }
+static String macroLuaPopError(lua_State* L) {
+    String out;
+    if (lua_gettop(L) == 0) { return out; }
+
+    size_t len = 0;
+    const char* s = lua_tolstring(L, -1, &len);
+    if (s == NULL) {
+        // Ошибка не является строкой — конвертируем (например таблица)
+        luaL_tolstring(L, -1, &len);
+        s = lua_tostring(L, -1);
     }
-    return true;
+    if (s != NULL && len > 0) {
+        out.reserve((unsigned int)len);
+        for (size_t i = 0; i < len; i++) { out += s[i]; }
+    }
+    lua_settop(L, 0);
+    return out;
 }
 
-/** Исполняет Tcl-код по отдельным командам: режет скрипт уровня 0
- (учитывая {} [] "" и комментарии #) и вызывает tcl_eval для каждой команды.
- Процедуры и переменные интерпретатора сохраняются между вызовами.
- \param t интерпретатор
- \param src текст сценария
- \param errOut текст ошибки (при FERROR)
- \return FERROR при ошибке, иначе FNORMAL
+/** Исполняет файл-сценарий в состоянии файла под защитой hook'а.
+  Загружает содержимое как chunk (имя "@путь" для сообщений об ошибках)
+  и вызывает его; регистрация правил происходит на верхнем уровне.
+ \param f сценарий
+ \param content текст сценария
+ \return код возврата Lua (LUA_OK при успехе); текст ошибки — в f.err
  */
-static int macroEvalChunks(struct tcl* t, const String& src, String* errOut) {
-    String chunk;
-    int brace = 0;
-    int bracket = 0;
-    bool inQuote = false;
-    bool comment = false;
-    size_t len = src.length();
+static int macroLuaRunChunk(MacroFile& f, const String& content) {
+    lua_State* L = f.lua ? f.lua->getLuaState() : NULL;
+    if (L == NULL) { f.err = "No interpreter"; return LUA_ERRRUN; }
 
-    for (size_t i = 0; i < len; i++) {
-        char c = src.charAt((unsigned int)i);
+    String cn = "@";
+    cn += f.name;
 
-        if (comment) {
-            if (c == '\n' || c == '\r') { comment = false; }
-            continue;
-        }
-        // Комментарий до конца строки (только в начале команды)
-        if (c == '#' && brace == 0 && bracket == 0 && !inQuote && macroWsOnly(chunk)) {
-            comment = true;
-            continue;
-        }
-        // Разделитель команд (вне {} [] "")
-        if (!inQuote && brace == 0 && bracket == 0 && (c == '\n' || c == ';')) {
-            chunk.trim();
-            if (chunk.length() > 0) {
-                // Ошибкой считаем только FERROR: proc-определения на верхнем
-                // уровне возвращают FRETURN - это не ошибка разбора.
-                int r = tcl_eval(t, chunk.c_str(), chunk.length() + 1);
-                if (r == FERROR) {
-                    if (errOut != NULL && errOut->length() == 0 && t->result &&
-                        tcl_length(t->result) > 0) {
-                        *errOut = tclValueToString(t->result);
-                    }
-                    return r;
-                }
-            }
-            chunk = "";
-            continue;
-        }
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
 
-        if (!inQuote) {
-            if (c == '{') { brace++; }
-            else if (c == '}') { if (brace > 0) { brace--; } }
-            else if (c == '[') { bracket++; }
-            else if (c == ']') { if (bracket > 0) { bracket--; } }
-            else if (c == '"') { inQuote = true; }
-        } else if (c == '"') {
-            inQuote = false;
-        }
-        chunk += c;
+    int status = luaL_loadbuffer(L, content.c_str(), content.length(), cn.c_str());
+    if (status == LUA_OK) {
+        status = lua_pcall(L, 0, 0, 0);
     }
+    lua_sethook(L, NULL, 0, 0);
 
-    // Последняя команда
-    chunk.trim();
-    if (chunk.length() > 0) {
-        int r = tcl_eval(t, chunk.c_str(), chunk.length() + 1);
-        if (r == FERROR) {
-            if (errOut != NULL && errOut->length() == 0 && t->result &&
-                tcl_length(t->result) > 0) {
-                *errOut = tclValueToString(t->result);
-            }
-            return r;
-        }
+    if (status != LUA_OK) {
+        f.err = macroLuaPopError(L);
+        if (f.err.length() == 0) { f.err = "Scenario parse error"; }
+        lua_settop(L, 0);
+    } else {
+        lua_settop(L, 0);
     }
-    return FNORMAL;
+    return status;
 }
+
+// ============================================================
+// Команды Lua, регистрируемые в интерпретаторах сценариев
+// ============================================================
+
+/** Регистрирует сущность (cron/cond/term/button) в таблице сценария.
+  Допустимо только во время разбора файла. Команды получают контекст
+  файла как userdata-upvalue (передаётся через EspLuaEngine::registerFunction).
+ \param L состояние Lua
+ \param type тип сущности (MACRO_ENT_*)
+ \return число результатов Lua (0)
+ */
+static int macroLuaRegisterEntity(lua_State* L, uint8_t type) {
+    LuaMacroCtx* ctx = (LuaMacroCtx*)lua_touserdata(L, lua_upvalueindex(1));
+    if (ctx == NULL || ctx->file == NULL) {
+        return luaL_error(L, "no scenario context");
+    }
+    if (ctx->parsing == false) {
+        return luaL_error(L, "rules can be registered only during file parse");
+    }
+
+    MacroFile* f = ctx->file;
+    int narg = lua_gettop(L);
+
+    String spec;
+    if (type == MACRO_ENT_COND) {
+        // cond(function-условие, function-тело)
+        if (narg < 2) { return luaL_error(L, "usage: cond(function, function)"); }
+        luaL_checktype(L, 1, LUA_TFUNCTION);
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+    } else {
+        // cron/term/button(specifier, function-тело)
+        if (narg < 2) { return luaL_error(L, "usage: rule(specifier, function)"); }
+        const char* s = luaL_checkstring(L, 1);
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+        spec = String(s);
+        spec.trim();
+        if (spec.length() == 0) { return luaL_error(L, "empty specifier"); }
+    }
+
+    if (f->nEnts >= MACRO_MAX_ENTS) {
+        return luaL_error(L, "file rule limit exceeded");
+    }
+
+    MacroEntity& e = f->ents[f->nEnts];
+    e.type    = type;
+    e.spec    = spec;
+    e.bodyRef = LUA_NOREF;
+    e.condRef = LUA_NOREF;
+    e.lastCond = false;
+    e.next     = 0;
+
+    if (type == MACRO_ENT_CRON) {
+        const char* perr = NULL;
+        cron_expr cx;
+        memset(&cx, 0, sizeof(cx));
+        cron_parse_expr(spec.c_str(), &cx, &perr);
+        if (perr) {
+            return luaL_error(L, "cron expression error: %s (%s)", perr, spec.c_str());
+        }
+        e.expr = cx;
+    }
+
+    // Тело — аргумент 2 (функция)
+    lua_pushvalue(L, 2);
+    e.bodyRef = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    // Условие cond — аргумент 1 (функция)
+    if (type == MACRO_ENT_COND) {
+        lua_pushvalue(L, 1);
+        e.condRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    f->nEnts++;
+    DEBUGMACROS("[MACRO] reg: type=%d\r\n", (int)type);
+    return 0;
+}
+
+static int macroLuaRegCron(lua_State* L)   { return macroLuaRegisterEntity(L, MACRO_ENT_CRON); }
+static int macroLuaRegCond(lua_State* L)   { return macroLuaRegisterEntity(L, MACRO_ENT_COND); }
+static int macroLuaRegTerm(lua_State* L)   { return macroLuaRegisterEntity(L, MACRO_ENT_TERM); }
+static int macroLuaRegButton(lua_State* L) { return macroLuaRegisterEntity(L, MACRO_ENT_BUTTON); }
+
+// puts/print — вывод в последовательный порт с префиксом [MACRO]
+/** Функции Lua puts/print: выводят аргументы в терминал с префиксом [MACRO].
+ \param L состояние Lua
+ \return число результатов Lua (0)
+ */
+static int macroLuaPuts(lua_State* L) {
+    int n = lua_gettop(L);
+    Serial.printf("[MACRO] ");
+    for (int i = 1; i <= n; i++) {
+        bool pushed = false;
+        size_t len = 0;
+        const char* s = NULL;
+        if (lua_isstring(L, i) || lua_isnumber(L, i)) {
+            s = lua_tolstring(L, i, &len);
+        } else {
+            // Булевы/nil/таблицы — через luaL_tolstring (__tostring)
+            s = luaL_tolstring(L, i, &len);
+            pushed = true;
+        }
+        if (s != NULL && len > 0) {
+            Serial.write((const uint8_t*)s, len);
+        }
+        if (pushed) { lua_pop(L, 1); }
+        if (i < n) { Serial.print(" "); }
+    }
+    Serial.printf("\r\n");
+    return 0;
+}
+
+// now — текущие секунды (локальное «наивное» время TimeLib)
+/** Функция Lua now: возвращает текущие секунды (локальное время TimeLib).
+ \param L состояние Lua
+ \return число результатов Lua (1 — целые секунды)
+ */
+static int macroLuaNow(lua_State* L) {
+    lua_pushinteger(L, (lua_Integer)now());
+    return 1;
+}
+
+// clock — текущее время в формате ЧЧ:ММ:СС
+/** Функция Lua clock: возвращает текущее время в формате ЧЧ:ММ:СС.
+ \param L состояние Lua
+ \return число результатов Lua (1 — строка)
+ */
+static int macroLuaClock(lua_State* L) {
+    time_t tnow = (time_t)now();
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+             (int)hour(tnow), (int)minute(tnow), (int)second(tnow));
+    lua_pushstring(L, buf);
+    return 1;
+}
+
+// ============================================================
+// Методы класса (движок сценариев)
+// ============================================================
 
 /** Освобождает интерпретатор файла и очищает таблицу его сущностей.
  \param f сценарий
  */
 void CLASS_MODULE_MACROS::destroyScript(MacroFile& f) {
-    if (f.tcl) {
-        tcl_destroy(f.tcl);
-        free(f.tcl);
-        f.tcl = NULL;
+    if (f.lua) {
+        delete f.lua;
+        f.lua = NULL;
     }
     for (uint8_t i = 0; i < f.nEnts; i++) {
-        f.ents[i].spec = "";
-        f.ents[i].body = "";
+        f.ents[i].spec    = "";
+        f.ents[i].bodyRef = LUA_NOREF;
+        f.ents[i].condRef = LUA_NOREF;
     }
     f.nEnts = 0;
     f.active = false;
+    f.ctx.file = NULL;
     f.ctx.parsing = false;
 }
 
-/** Разбирает файл сценария: читает содержимое из FS, создаёт интерпретатор,
- регистрирует команды, исполняет файл по командам и заполняет таблицу сущностей.
+/** Разбирает файл сценария: читает содержимое из FS, создаёт состояние Lua,
+  регистрирует команды модуля, исполняет файл и заполняет таблицу сущностей.
  \param f сценарий (runtime-часть)
  \return true — разбор успешен и есть хотя бы одно правило
  */
@@ -163,25 +278,44 @@ bool CLASS_MODULE_MACROS::parseScript(MacroFile& f) {
         return false;
     }
 
-    struct tcl* t = (struct tcl*)calloc(1, sizeof(struct tcl));
-    if (t == NULL) {
+    EspLuaEngine* eng = new (std::nothrow) EspLuaEngine();
+    if (eng == NULL || eng->getLuaState() == NULL) {
+        delete eng;
         f.err = "No memory for interpreter";
+        DEBUGMACROS("%s: %s\r\n", __FUNCTION__, f.err.c_str());
         return false;
     }
-    tcl_init(t);
-    f.tcl = t;
+    f.lua = eng;
+
     f.ctx.file = &f;
-
-    macroTclRegisterExtras(t, (void*)&f.ctx);
-
-    f.ctx.parsing = true;
-    int r = macroEvalChunks(t, content, &f.err);
     f.ctx.parsing = false;
 
-    if (r == FERROR) {
-        if (f.err.length() == 0) {
-            f.err = "Scenario parse error";
-        }
+    // Регистрация команд и функций сценария в состояние файла.
+    // Контекст (&f.ctx) передаётся как userdata-upvalue командам регистрации.
+    bool reg =
+        eng->registerFunction("cron",   macroLuaRegCron,   &f.ctx) &&
+        eng->registerFunction("cond",   macroLuaRegCond,   &f.ctx) &&
+        eng->registerFunction("term",   macroLuaRegTerm,   &f.ctx) &&
+        eng->registerFunction("button", macroLuaRegButton, &f.ctx) &&
+        eng->registerFunction("puts",   macroLuaPuts) &&
+        eng->registerFunction("print",  macroLuaPuts) &&
+        eng->registerFunction("clock",  macroLuaClock) &&
+        eng->registerFunction("now",    macroLuaNow);
+    if (reg == false) {
+        f.err = "Lua init error";
+        DEBUGMACROS("%s: %s\r\n", __FUNCTION__, f.err.c_str());
+        destroyScript(f);
+        return false;
+    }
+
+    // Исполнение файла по верхнему уровню: регистрация правил происходит
+    // при вызовах cron/cond/term/button внутри chunk'а.
+    f.ctx.parsing = true;
+    int status = macroLuaRunChunk(f, content);
+    f.ctx.parsing = false;
+
+    if (status != LUA_OK) {
+        if (f.err.length() == 0) { f.err = "Scenario parse error"; }
         DEBUGMACROS("%s: %s -> %s\r\n", __FUNCTION__, f.name.c_str(), f.err.c_str());
         destroyScript(f);
         return false;
@@ -200,7 +334,7 @@ bool CLASS_MODULE_MACROS::parseScript(MacroFile& f) {
 }
 
 /** Синхронизирует интерпретаторы с метой: останавливает удалённые/выключенные
- файлы и переразбирает запущенные.
+  файлы и переразбирает запущенные.
  */
 void CLASS_MODULE_MACROS::rebuildScripts() {
     for (uint8_t i = 0; i < _fileCount; i++) {
@@ -219,57 +353,87 @@ void CLASS_MODULE_MACROS::rebuildScripts() {
     }
 }
 
-/** Выполняет тело правила в интерпретаторе файла.
+/** Выполняет функцию-тело правила в интерпретаторе файла (по ссылке registry).
  \param f сценарий
- \param body текст тела (Tcl)
+ \param bodyRef ссылка LUA_REGISTRYINDEX на функцию
  \return пустая строка при успехе, иначе текст ошибки
  */
-String CLASS_MODULE_MACROS::runBody(MacroFile& f, const String& body) {
-    if (f.tcl == NULL || f.active == false) { return "No interpreter"; }
+String CLASS_MODULE_MACROS::runBody(MacroFile& f, int bodyRef) {
+    if (f.lua == NULL || f.active == false) { return "No interpreter"; }
+    if (bodyRef == LUA_NOREF) { return "No body function"; }
+
+    lua_State* L = f.lua->getLuaState();
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, bodyRef);
+    int status = lua_pcall(L, 0, 0, 0);
+    lua_sethook(L, NULL, 0, 0);
+
     String errTxt;
-    int r = macroEvalChunks(f.tcl, body, &errTxt);
-    if (r == FERROR) {
-        if (errTxt.length() > 0) { return errTxt; }
-        return "Scenario execution error";
+    if (status != LUA_OK) {
+        errTxt = macroLuaPopError(L);
+        if (errTxt.length() == 0) { errTxt = "Scenario execution error"; }
+        lua_settop(L, 0);
+    } else {
+        lua_settop(L, 0);
     }
-    return "";
+    return errTxt;
 }
 
 // Выполнение тела с записью ошибки в файл (метод класса: доступ к runBody)
-/** Выполняет тело правила и записывает ошибку в f.err (с выводом в журнал).
+/** Выполняет тело сущности и записывает ошибку в f.err (с выводом в журнал).
  \param f сценарий
- \param body текст тела
+ \param e сущность (cron/cond/term/button)
  */
-void CLASS_MODULE_MACROS::execBody(MacroFile& f, const String& body) {
-    String err = runBody(f, body);
+void CLASS_MODULE_MACROS::execBody(MacroFile& f, MacroEntity& e) {
+    String err = runBody(f, e.bodyRef);
     if (err.length() > 0) {
         f.err = err;
         DEBUGMACROS("[MACRO] %s exec error: %s\r\n", f.name.c_str(), err.c_str());
     }
 }
 
-// Вычисление Tcl-условия; возвращает истину/ложь, при ошибке пишет текст в errOut
-/** Вычисляет Tcl-условие правила cond.
+// Вычисление Lua-условия cond; возвращает истину/ложь, при ошибке пишет текст в errTxt
+/** Вычисляет условие cond-правила (функция из condRef).
  \param f сценарий
- \param cond текст условия
- \param errOut текст ошибки
- \return истинность условия (0 = ложь)
+ \param e сущность cond
+ \param errTxt текст ошибки (пуст при успехе)
+ \return истинность условия
  */
-static bool macroEvalCond(MacroFile& f, const String& cond, String& errOut) {
-    if (f.tcl == NULL || f.active == false) {
-        errOut = "No interpreter";
+bool CLASS_MODULE_MACROS::evalCondEntity(MacroFile& f, MacroEntity& e, String& errTxt) {
+    errTxt = "";
+    if (f.lua == NULL || f.active == false) {
+        errTxt = "No interpreter";
         return false;
     }
-    int r = macroEvalChunks(f.tcl, cond, &errOut);
-    if (r == FERROR) {
-        if (errOut.length() == 0) { errOut = "Condition evaluation error"; }
+    if (e.condRef == LUA_NOREF) {
+        errTxt = "No condition function";
         return false;
     }
-    return (tcl_int(f.tcl->result) != 0);
+
+    lua_State* L = f.lua->getLuaState();
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, e.condRef);
+    int status = lua_pcall(L, 0, 1, 0);
+    lua_sethook(L, NULL, 0, 0);
+
+    if (status != LUA_OK) {
+        errTxt = macroLuaPopError(L);
+        if (errTxt.length() == 0) { errTxt = "Condition evaluation error"; }
+        lua_settop(L, 0);
+        return false;
+    }
+
+    bool truth = (lua_toboolean(L, -1) != 0);
+    lua_settop(L, 0);
+    return truth;
 }
 
 /** Обрабатывает очередь внешних событий: сопоставляет term/button-правила
- запущенных файлов и выполняет их тела.
+  запущенных файлов и выполняет их тела.
  */
 void CLASS_MODULE_MACROS::drainEvents() {
     while (_evIn != _evOut) {
@@ -284,7 +448,7 @@ void CLASS_MODULE_MACROS::drainEvents() {
                 if (e.type == ev.type && e.spec == ev.spec) {
                     const char* tn = (ev.type == MACRO_ENT_TERM) ? "term" : "button";
                     Serial.printf("[MACRO] condition %s \"%s\" fired\r\n", tn, ev.spec.c_str());
-                    execBody(f, e.body);
+                    execBody(f, e);
                 }
             }
         }
@@ -292,7 +456,7 @@ void CLASS_MODULE_MACROS::drainEvents() {
 }
 
 /** Один шаг исполнительной машины (раз в секунду): при изменении списка
- пересобирает сценарии, затем обрабатывает события и исполняет cron/cond-правила.
+  пересобирает сценарии, затем обрабатывает события и исполняет cron/cond-правила.
  */
 void CLASS_MODULE_MACROS::tickStep() {
     // Пересборка интерпретаторов при изменении списка
@@ -344,14 +508,14 @@ void CLASS_MODULE_MACROS::tickStep() {
 
                 if ((time_t)now() >= e.next) {
                     DEBUGMACROS("[MACRO] %s cron(%s)\r\n", f.name.c_str(), e.spec.c_str());
-                    execBody(f, e.body);
+                    execBody(f, e);
                     e.next = cron_next(&e.expr, (time_t)now());
                 }
             }
 
             if (e.type == MACRO_ENT_COND) {
                 String errTxt;
-                bool truth = macroEvalCond(f, e.spec, errTxt);
+                bool truth = evalCondEntity(f, e, errTxt);
                 if (errTxt.length() > 0) {
                     f.err = errTxt;
                     DEBUGMACROS("[MACRO] %s cond error: %s\r\n", f.name.c_str(), errTxt.c_str());
@@ -361,7 +525,7 @@ void CLASS_MODULE_MACROS::tickStep() {
                     // Фронт false -> true
                     DEBUGMACROS("[MACRO] %s cond(true)\r\n", f.name.c_str());
                     e.lastCond = true;
-                    execBody(f, e.body);
+                    execBody(f, e);
                 } else if (truth == false) {
                     e.lastCond = false;
                 }
@@ -369,185 +533,3 @@ void CLASS_MODULE_MACROS::tickStep() {
         }
     }
 }
-
-
-
-// ============================================================
-// Команды Tcl, регистрируемые в интерпретаторах сценариев
-// ============================================================
-
-// Записать в result текст ошибки и вернуть FERROR
-/** Записывает текст ошибки в результат интерпретатора и возвращает FERROR.
- */
-static int macroTclResultError(struct tcl* t, const char* msg) {
-    return tcl_result(t, FERROR, tcl_alloc(msg, strlen(msg)));
-}
-
-/** То же, что macroTclResultError, но принимает Arduino String.
- */
-static int macroTclResultErrorS(struct tcl* t, const String& msg) {
-    if (msg.length() == 0) { return macroTclResultError(t, "error"); }
-    return tcl_result(t, FERROR, tcl_alloc(msg.c_str(), msg.length()));
-}
-
-// Прочитать слово аргумента списком в String
-/** Читает аргумент команды Tcl из списка и копирует его в Arduino String.
- \param t интерпретатор
- \param args список аргументов
- \param idx индекс аргумента
- \param ok true, если аргумент получен
- \return строка аргумента
- */
-static String macroReadArg(struct tcl* t, tcl_value_t* args, int idx, bool* ok) {
-    *ok = false;
-    tcl_value_t* v = tcl_list_at(args, idx);
-    if (v == NULL) { return ""; }
-    String s = tclValueToString(v);
-    tcl_free(v);
-    *ok = true;
-    return s;
-}
-
-// Копия значения Tcl в Arduino String (переносимо между ESP32/ESP8266)
-/** Копирует значение Tcl в Arduino String (переносимо между ESP32/ESP8266).
- \param v значение pTcl (или NULL)
- \return строка
- */
-static String tclValueToString(tcl_value_t* v) {
-    String out;
-    if (v == NULL) { return out; }
-    int len = tcl_length(v);
-    const char* s = tcl_string(v);
-    out.reserve((unsigned int)len);
-    for (int i = 0; i < len; i++) { out += s[i]; }
-    return out;
-}
-
-// Регистрация сущности: cron / cond / button / term {spec} {body}
-extern "C" {
-/** Команда Tcl cron/cond/button/term: регистрирует правило в таблице сценария.
- Допустима только во время разбора файла.
- \param t интерпретатор
- \param args список аргументов (команда, спецификатор, тело)
- \param arg контекст PtclMacroCtx
- \return код потока управления
- */
-static int tclCmdEntity(struct tcl* t, tcl_value_t* args, void* arg) {
-    PtclMacroCtx* pc = (PtclMacroCtx*)arg;
-    if (pc == NULL || pc->file == NULL) { return macroTclResultError(t, "no scenario context"); }
-    if (pc->parsing == false) { return macroTclResultError(t, "rules can be registered only during file parse"); }
-
-    MacroFile* f = pc->file;
-    if (tcl_list_length(args) != 3) { return macroTclResultError(t, "usage: <cmd> {specifier} {body}"); }
-
-    tcl_value_t* namev = tcl_list_at(args, 0);
-    const char* cmdName = namev ? tcl_string(namev) : "";
-    DEBUGMACROS("[MACRO] reg: %s\r\n", cmdName);
-    uint8_t type;
-    if (strcmp(cmdName, "cron") == 0)        { type = MACRO_ENT_CRON; }
-    else if (strcmp(cmdName, "cond") == 0)   { type = MACRO_ENT_COND; }
-    else if (strcmp(cmdName, "button") == 0) { type = MACRO_ENT_BUTTON; }
-    else if (strcmp(cmdName, "term") == 0)   { type = MACRO_ENT_TERM; }
-    else {
-        if (namev) { tcl_free(namev); }
-        return macroTclResultError(t, "unknown registration command");
-    }
-    if (namev) { tcl_free(namev); }
-
-    if (f->nEnts >= MACRO_MAX_ENTS) { return macroTclResultError(t, "file rule limit exceeded"); }
-
-    bool ok1, ok2;
-    String spec = macroReadArg(t, args, 1, &ok1);
-    String body = macroReadArg(t, args, 2, &ok2);
-    if (ok1 == false || ok2 == false) { return macroTclResultError(t, "not enough arguments"); }
-    spec.trim();
-    if (spec.length() == 0) { return macroTclResultError(t, "empty specifier"); }
-    if (body.length() == 0) { return macroTclResultError(t, "empty rule body"); }
-
-    MacroEntity& e = f->ents[f->nEnts];
-    e.type = type;
-    e.spec = spec;
-    e.body = body;
-    e.lastCond = false;
-    e.next = 0;
-
-    if (type == MACRO_ENT_CRON) {
-        const char* perr = NULL;
-        cron_expr cx;
-        memset(&cx, 0, sizeof(cx));
-        cron_parse_expr(spec.c_str(), &cx, &perr);
-        if (perr) {
-            String msg = "cron expression error: ";
-            msg += perr;
-            msg += " (";
-            msg += spec;
-            msg += ")";
-            return macroTclResultErrorS(t, msg);
-        }
-        e.expr = cx;
-    }
-
-    f->nEnts++;
-    return tcl_result(t, FNORMAL, tcl_alloc("", 0));
-}
-
-// puts — вывод в последовательный порт
-/** Команда Tcl puts: выводит текст в терминал с префиксом [MACRO].
- */
-static int tclCmdPuts(struct tcl* t, tcl_value_t* args, void* arg) {
-    (void)arg;
-    if (tcl_list_length(args) < 2) { return tcl_result(t, FNORMAL, tcl_alloc("", 0)); }
-
-    tcl_value_t* text = tcl_list_at(args, 1);
-    if (text == NULL) { return tcl_result(t, FNORMAL, tcl_alloc("", 0)); }
-
-    const char* s = tcl_string(text);
-    int len = tcl_length(text);
-    Serial.printf("[MACRO] ");
-    for (int i = 0; i < len; i++) { Serial.write((uint8_t)s[i]); }
-    Serial.printf("\r\n");
-
-    int r = tcl_result(t, FNORMAL, tcl_dup(text));
-    tcl_free(text);
-    return r;
-}
-
-// now — текущие секунды (локальное «наивное» время TimeLib)
-/** Команда Tcl now: возвращает текущие секунды (локальное «наивное» время TimeLib).
- */
-static int tclCmdNow(struct tcl* t, tcl_value_t* args, void* arg) {
-    (void)args;
-    (void)arg;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)now());
-    return tcl_result(t, FNORMAL, tcl_alloc(buf, strlen(buf)));
-}
-
-// clock — текущее время в формате ЧЧ:ММ:СС (для печати в примерах)
-/** Команда Tcl clock: возвращает текущее время в формате ЧЧ:ММ:СС.
- */
-static int tclCmdClock(struct tcl* t, tcl_value_t* args, void* arg) {
-    (void)args;
-    (void)arg;
-    time_t tnow = (time_t)now();
-    char buf[10];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
-             (int)hour(tnow), (int)minute(tnow), (int)second(tnow));
-    return tcl_result(t, FNORMAL, tcl_alloc(buf, strlen(buf)));
-}
-
-/** Регистрирует в интерпретаторе команды модуля (cron/cond/button/term/puts/now/clock).
- \param t интерпретатор
- \param ctx контекст файла для команд регистрации
- */
-static void macroTclRegisterExtras(struct tcl* t, void* ctx) {
-    tcl_register(t, "cron",   tclCmdEntity, 0, ctx);
-    tcl_register(t, "cond",   tclCmdEntity, 0, ctx);
-    tcl_register(t, "button", tclCmdEntity, 0, ctx);
-    tcl_register(t, "term",   tclCmdEntity, 0, ctx);
-    tcl_register(t, "puts",   tclCmdPuts, 0, ctx);
-    tcl_register(t, "now",    tclCmdNow, 0, ctx);
-    tcl_register(t, "clock",  tclCmdClock, 0, ctx);
-}
-} // extern "C"
-

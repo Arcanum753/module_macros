@@ -3,24 +3,24 @@
 
 // ============================================================
 // module_macros_engine.h — данные и интерфейс исполнительной машины
-// сценариев (Tcl-интерпретатор pTcl + cron/ccronexpr).
+// сценариев (Lua 5.4 через EspLuaEngine + cron/ccronexpr).
 // Реализация: module_macros_engine.cpp
 // ============================================================
 
 #include "main.h"
 
-#include "tcl.h"
 #include "ccronexpr.h"
+#include "EspLuaEngine/EspLuaEngine.h"
 
-// Ограничения прототипа (ESP8266 RAM ограничен — лимиты ниже)
-#if defined(ESP32)
+// Ограничения прототипа (модуль предназначен только для ESP32)
 #define MACRO_MAX_FILES       16     ///< максимум файлов-сценариев в списке
 #define MACRO_MAX_ENTS        24     ///< максимум сущностей в одном файле
-#elif defined(ESP8266)
-#define MACRO_MAX_FILES       8      ///< максимум файлов-сценариев в списке
-#define MACRO_MAX_ENTS        8      ///< максимум сущностей в одном файле
-#endif
 #define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button)
+
+// Защита от «зависаний» сценария: счётчик VM-инструкций Lua (аналог
+// старого лимита TCL_MAX_STEPS=100000 в pTcl).
+#define MACRO_LUA_MAX_OPS     100000 ///< максимум инструкций Lua на один вызов
+#define MACRO_LUA_HOOK_N      1000   ///< шаг срабатывания count-hook (инструкций)
 
 /// Типы сущностей сценария
 #define MACRO_ENT_CRON        0      ///< «момент времени» по cron-выражению
@@ -36,17 +36,19 @@ typedef struct {
 
 struct MacroFile;
 
-/// Контекст разбора/исполнения Tcl-файла. Передаётся как arg в tcl_register.
+/// Контекст разбора/исполнения Lua-файла. Указатель на этот контекст
+/// передаётся в команды сценария как userdata-upvalue (см. macroLuaReg*).
 typedef struct {
     struct MacroFile* file;  ///< файл, которому принадлежит интерпретатор
     bool parsing;            ///< true — идёт разбор файла (регистрация сущностей)
-} PtclMacroCtx;
+} LuaMacroCtx;
 
 /// Одна сущность сценария (строка «таблицы условий и моментов времени»)
 typedef struct {
     uint8_t   type;          ///< MACRO_ENT_*
-    String    spec;          ///< cron-выражение / Tcl-условие / токен button|term
-    String    body;          ///< тело на Tcl
+    String    spec;          ///< cron-выражение / слова term|button (для cond не используется)
+    int       bodyRef;       ///< ссылка LUA_REGISTRYINDEX на функцию-тело
+    int       condRef;       ///< ссылка LUA_REGISTRYINDEX на условие (только MACRO_ENT_COND), иначе LUA_NOREF
     cron_expr expr;          ///< разобранное cron-выражение (для MACRO_ENT_CRON)
     time_t    next;          ///< следующее срабатывание cron (0 — не инициализировано)
     bool      lastCond;      ///< предыдущее состояние условия (для MACRO_ENT_COND)
@@ -55,7 +57,7 @@ typedef struct {
 /// Файл-сценарий: метаданные (сохраняются в JSON) + runtime-состояние
 typedef struct MacroFile {
     // --- метаданные (config_macros.json) ---
-    String    name;          ///< полный путь: /macros/xxx.tcl
+    String    name;          ///< полный путь: /macros/xxx.lua
     uint8_t   prio;          ///< приоритет 0..7 (0 — высший)
     bool      run;           ///< включён пользователем
     uint32_t  created;       ///< время создания (локальное, TimeLib)
@@ -63,8 +65,8 @@ typedef struct MacroFile {
     // --- runtime-состояние (не сохраняется) ---
     bool      active;        ///< файл запущен и успешно разобран
     String    err;           ///< текст последней ошибки (пусто — ошибок нет)
-    struct tcl* tcl;         ///< интерпретатор файла (только когда active)
-    PtclMacroCtx ctx;        ///< контекст для команд Tcl (ctx.file указывает на этот файл)
+    EspLuaEngine* lua;       ///< интерпретатор Lua файла (только когда active)
+    LuaMacroCtx  ctx;        ///< контекст команд Lua (ctx.file указывает на этот файл)
     MacroEntity ents[MACRO_MAX_ENTS];
     uint8_t   nEnts;         ///< число сущностей в ents
 } MacroFile;
@@ -73,14 +75,5 @@ typedef struct MacroFile {
 typedef struct {
     bool enabled;            ///< модуль включён
 } strMacrosConfig;
-
-/**
- * Выполняет Tcl-скрипт по командам верхнего уровня (используется tcl.c
- * для тел пользовательских proc). Реализовано в module_macros_engine.cpp.
- * \param t интерпретатор pTcl
- * \param src null-терминированный текст сценария
- * \return FNORMAL при успехе либо код потока управления/FERROR
- */
-extern "C" int macroTclEvalScript(struct tcl* t, const char* src);
 
 #endif // _MODULE_MACROS_ENGINE_h

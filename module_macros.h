@@ -13,29 +13,19 @@
 #define DEBUGMACROS(...)
 #endif
 
-#if defined(ESP32)
 #include <LittleFS.h>
-#endif
-#if defined(ESP8266)
-#include <LittleFS.h>
-#endif
 
 #define CONFIG_FILE_MACROS    "/config_macros.json"
 #define MACROS_DIR            "/macros"
 #define MACROS_DIR_RE         "/macros/"
-#define MACRO_DEFAULT_NAME    "new_macros.tcl"
+#define MACRO_DEFAULT_NAME    "new_macros.lua"
 
 class AsyncWebServerRequest;
 
 class CLASS_MODULE_MACROS {
 public:
     CLASS_MODULE_MACROS(bool _in);
-#if defined(ESP32)
     void setFs(fs::LittleFSFS* fs);
-#endif
-#if defined(ESP8266)
-    void setFs(FS* fs);
-#endif
     void begin();
     void begin(ModContext& ctx);
     void web_Init();
@@ -74,11 +64,11 @@ private:
     bool nameOk(const String& name);         // проверка имени (без пути)
     void bumpMeta();                         // отметить изменение списка (пересборка в tick)
     void reconcileList();                    // скан /macros + слияние с метой + сохранение
-    void ensureMacrosDir();                  // создать /macros и пример example.tcl
+    void ensureMacrosDir();                  // создать /macros и пример example.lua
     String readFile(const String& path);     // содержимое файла в String
     bool writeFile(const String& path, const String& data);
     bool fsRenameFile(const String& oldPath, const String& newPath); // копия + удаление
-    String uniqueNewName(const String& tmpl);// свободное имя (new_macros.tcl, new_macros1.tcl, ...)
+    String uniqueNewName(const String& tmpl);// свободное имя (new_macros.lua, new_macros1.lua, ...)
 
     // Операции со списком (общие для HTTP и терминала)
     bool addFileEntry(const String& base, uint8_t prio, bool run); // новый файл в списке
@@ -92,19 +82,15 @@ private:
     bool parseScript(MacroFile& f);          // разобрать файл в таблицу сущностей
     void destroyScript(MacroFile& f);        // освободить интерпретатор
     void rebuildScripts();                   // синхронизация _files -> интерпретаторы
-    String runBody(MacroFile& f, const String& body); // выполнить тело, вернуть ошибку
-    void execBody(MacroFile& f, const String& body);  // выполнить тело и записать ошибку
+    String runBody(MacroFile& f, int bodyRef);            // выполнить функцию-тело, вернуть ошибку
+    void execBody(MacroFile& f, MacroEntity& e);          // выполнить тело сущности и записать ошибку
+    bool evalCondEntity(MacroFile& f, MacroEntity& e, String& errTxt); // вычислить условие cond
     void drainEvents();                      // обработка очереди внешних событий
     void tickStep();                         // шаг исполнения (cron/cond) за одну секунду
 
 protected:
     bool dumb;
-#if defined(ESP32)
     fs::LittleFSFS* _fs;
-#endif
-#if defined(ESP8266)
-    FS* _fs;
-#endif
 
     strMacrosConfig _config;
     MacroFile _files[MACRO_MAX_FILES];

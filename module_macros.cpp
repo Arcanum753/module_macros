@@ -41,12 +41,7 @@ void macroCmd();
 // ============================================================
 // setFs()
 // ============================================================
-#if defined(ESP32)
-void CLASS_MODULE_MACROS::setFs(fs::LittleFSFS* fs)
-#elif defined(ESP8266)
-void CLASS_MODULE_MACROS::setFs(FS* fs)
-#endif
-{
+void CLASS_MODULE_MACROS::setFs(fs::LittleFSFS* fs) {
     _fs = fs;
 }
 
@@ -207,7 +202,7 @@ void CLASS_MODULE_MACROS::handleCreate(AsyncWebServerRequest *request) {
         String n = request->arg("name");
         n.trim();
         if (n.length() > 0) {
-            if (!n.endsWith(".tcl")) { n += ".tcl"; }
+            if (!n.endsWith(".lua")) { n += ".lua"; }
             if (!nameOk(n)) { request->send(200, "text/plain", "ERR: bad name"); return; }
             tmpl = n;
         }
@@ -253,7 +248,7 @@ void CLASS_MODULE_MACROS::handleRename(AsyncWebServerRequest *request) {
     String newBase = request->arg("new");
     oldBase.trim();
     newBase.trim();
-    if (!newBase.endsWith(".tcl")) { newBase += ".tcl"; }
+    if (!newBase.endsWith(".lua")) { newBase += ".lua"; }
 
     if (renameFileEntry(oldBase, newBase)) {
         request->send(200, "text/plain", "OK");
@@ -368,7 +363,7 @@ bool CLASS_MODULE_MACROS::loadConfig() {
             if (f.name.length() == 0) { continue; }
             f.active = false;
             f.err = "";
-            f.tcl = NULL;
+            f.lua = NULL;
             f.ctx.file = NULL;
             f.ctx.parsing = false;
             f.nEnts = 0;
@@ -432,7 +427,7 @@ int CLASS_MODULE_MACROS::findFile(const String& name) {
 
 bool CLASS_MODULE_MACROS::nameOk(const String& name) {
     if (name.length() < 6 || name.length() > 48) { return false; }
-    if (!name.endsWith(".tcl")) { return false; }
+    if (!name.endsWith(".lua")) { return false; }
     for (uint8_t i = 0; i < name.length(); i++) {
         char c = name[i];
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -476,20 +471,20 @@ bool CLASS_MODULE_MACROS::fsRenameFile(const String& oldPath, const String& newP
 }
 
 String CLASS_MODULE_MACROS::uniqueNewName(const String& tmpl) {
-    String base = tmpl.substring(0, tmpl.length() - 4); // без ".tcl"
+    String base = tmpl.substring(0, tmpl.length() - 4); // без ".lua"
     String cand = tmpl;
     uint8_t idx = 0;
     while (_fs->exists(MACROS_DIR_RE + cand)) {
         idx++;
-        cand = base + String(idx) + ".tcl";
+        cand = base + String(idx) + ".lua";
         if (idx > 99) { break; }
     }
     return cand;
 }
 
 void CLASS_MODULE_MACROS::ensureMacrosDir() {
-    // Создаём каталог сценариев (примеры .tcl поставляются в составе FS-образа:
-    // web/macros/*.tcl -> /macros/*.tcl, см. python/4_fs_builder.py)
+    // Создаём каталог сценариев (примеры .lua поставляются в составе FS-образа:
+    // web/macros/*.lua -> /macros/*.lua, см. python/4_fs_builder.py)
     if (_fs->exists(MACROS_DIR) == false) {
         _fs->mkdir(MACROS_DIR);
         DEBUGMACROS("%s: dir %s created\r\n", __FUNCTION__, MACROS_DIR);
@@ -506,33 +501,20 @@ void CLASS_MODULE_MACROS::reconcileList() {
         }
     }
 
-    // 2) Сканируем каталог и добавляем новые .tcl
-#if defined(ESP32)
+    // 2) Сканируем каталог и добавляем новые .lua
     File root = _fs->open(MACROS_DIR);
     if (root) {
         File entry = root.openNextFile();
         while (entry) {
             if (entry.isDirectory() == false) {
                 String base = macroFileBaseName(String(entry.name()));
-                if (base.endsWith(".tcl")) {
+                if (base.endsWith(".lua")) {
                     if (findFile(MACROS_DIR_RE + base) < 0) { addFileEntry(base, 7, false); }
                 }
             }
             entry = root.openNextFile();
         }
     }
-#endif
-#if defined(ESP8266)
-    Dir dir = _fs->openDir(MACROS_DIR);
-    while (dir.next()) {
-        if (dir.isDirectory() == false) {
-            String base = macroFileBaseName(dir.fileName());
-            if (base.endsWith(".tcl")) {
-                if (findFile(MACROS_DIR_RE + base) < 0) { addFileEntry(base, 7, false); }
-            }
-        }
-    }
-#endif
 
     saveConfig();
     DEBUGMACROS("%s: total %d files\r\n", __FUNCTION__, _fileCount);
@@ -555,7 +537,7 @@ bool CLASS_MODULE_MACROS::addFileEntry(const String& base, uint8_t prio, bool ru
     f.created = (uint32_t)now();
     f.active  = false;
     f.err     = "";
-    f.tcl     = NULL;
+    f.lua     = NULL;
     f.ctx.file = &f;
     f.ctx.parsing = false;
     f.nEnts   = 0;
@@ -570,7 +552,7 @@ bool CLASS_MODULE_MACROS::createNewFile(const String& base, String& fullPath) {
     fullPath = MACROS_DIR_RE + cand;
 
     String empty;
-    empty = "# New macro script (Tcl). Register cron/cond/button/term rules.\r\n";
+    empty = "-- Новый сценарий (Lua). Регистрируйте правила cron/cond/button/term.\r\n";
     if (writeFile(fullPath, empty) == false) { return false; }
 
     if (addFileEntry(cand, 7, false) == false) {
@@ -757,14 +739,14 @@ void macroCmd() {
     }
     if (arg == "run") {
         String name = term.getNext();
-        if (name.length() == 0) { Serial.println("Usage: macro run <file.tcl>"); return; }
+        if (name.length() == 0) { Serial.println("Usage: macro run <file.lua>"); return; }
         if (module_macros.setFileRun(name, true)) { Serial.println("[MACRO] run " + name); }
         else { Serial.println("[MACRO] not found"); }
         return;
     }
     if (arg == "stop") {
         String name = term.getNext();
-        if (name.length() == 0) { Serial.println("Usage: macro stop <file.tcl>"); return; }
+        if (name.length() == 0) { Serial.println("Usage: macro stop <file.lua>"); return; }
         if (module_macros.setFileRun(name, false)) { Serial.println("[MACRO] stop " + name); }
         else { Serial.println("[MACRO] not found"); }
         return;
@@ -773,7 +755,7 @@ void macroCmd() {
         String name = term.getNext();
         String dir = term.getNext();
         if (name.length() == 0 || dir.length() == 0) {
-            Serial.println("Usage: macro prio <file.tcl> <+1|-1>");
+            Serial.println("Usage: macro prio <file.lua> <+1|-1>");
             return;
         }
         int8_t d = (int8_t)dir.toInt();
@@ -807,10 +789,10 @@ void macroCmd() {
 
     Serial.println("Commands:");
     Serial.println("  macro list                        - show scenarios");
-    Serial.println("  macro reload [file.tcl]           - re-read scenario(s)");
-    Serial.println("  macro run <file.tcl>              - start scenario");
-    Serial.println("  macro stop <file.tcl>             - stop scenario");
-    Serial.println("  macro prio <file.tcl> <delta>     - change priority");
+    Serial.println("  macro reload [file.lua]           - re-read scenario(s)");
+    Serial.println("  macro run <file.lua>              - start scenario");
+    Serial.println("  macro stop <file.lua>             - stop scenario");
+    Serial.println("  macro prio <file.lua> <delta>     - change priority");
     Serial.println("  macro msg <word> [params...]      - fire term-rules by full match");
     Serial.println("  macro btn <name> [params...]      - fire button-rules by full match");
 }

@@ -15,10 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-CLASS_MODULE_MACROS module_macros(false);
+CLASS_MODULE_MACROS module_macros;
 
-CLASS_MODULE_MACROS::CLASS_MODULE_MACROS(bool _in) {
-    dumb = _in;
+CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _fileCount = 0;
     _metaRev = 0;
     _scriptRev = 0;

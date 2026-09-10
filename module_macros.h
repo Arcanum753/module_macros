@@ -24,7 +24,7 @@ class AsyncWebServerRequest;
 
 class CLASS_MODULE_MACROS {
 public:
-    CLASS_MODULE_MACROS(bool _in);
+    CLASS_MODULE_MACROS();
     void setFs(fs::LittleFSFS* fs);
     void begin();
     void begin(ModContext& ctx);
@@ -89,7 +89,6 @@ private:
     void tickStep();                         // шаг исполнения (cron/cond) за одну секунду
 
 protected:
-    bool dumb;
     fs::LittleFSFS* _fs;
 
     strMacrosConfig _config;

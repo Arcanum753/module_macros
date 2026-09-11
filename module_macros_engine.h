@@ -16,6 +16,7 @@
 #define MACRO_MAX_FILES       16     ///< максимум файлов-сценариев в списке
 #define MACRO_MAX_ENTS        24     ///< максимум сущностей в одном файле
 #define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button)
+#define MACRO_MAX_SUBS        8      ///< максимум подписок на события шины на файл
 
 // Защита от «зависаний» сценария: счётчик VM-инструкций Lua (аналог
 // старого лимита TCL_MAX_STEPS=100000 в pTcl).
@@ -27,6 +28,7 @@
 #define MACRO_ENT_COND        1      ///< «условие» по фронту false->true
 #define MACRO_ENT_BUTTON      2      ///< событие с веб-страницы / внешнего вызова (macro btn)
 #define MACRO_ENT_TERM        3      ///< событие из терминала (macro msg)
+#define MACRO_ENT_BODY        4      ///< просто тело (bare function) — исполняется по мета-cron
 
 /// Внешнее событие (очередь term/button)
 typedef struct {
@@ -61,14 +63,32 @@ typedef struct MacroFile {
     uint8_t   prio;          ///< приоритет 0..7 (0 — высший)
     bool      run;           ///< включён пользователем
     uint32_t  created;       ///< время создания (локальное, TimeLib)
+    String    metaCron;      ///< cron-выражение окна из web-таблицы (мета)
 
     // --- runtime-состояние (не сохраняется) ---
     bool      active;        ///< файл запущен и успешно разобран
     String    err;           ///< текст последней ошибки (пусто — ошибок нет)
+    String    desc;          ///< описание из таблицы сценария
     EspLuaEngine* lua;       ///< интерпретатор Lua файла (только когда active)
     LuaMacroCtx  ctx;        ///< контекст команд Lua (ctx.file указывает на этот файл)
     MacroEntity ents[MACRO_MAX_ENTS];
     uint8_t   nEnts;         ///< число сущностей в ents
+
+    // Мета-cron (гейт окна)
+    cron_expr metaExpr;
+    bool      metaValid;     ///< cron разобран успешно
+    bool      metaInit;      ///< next инициализирован
+    time_t    metaNext;      ///< следующее срабатывание мета-cron
+
+    // Подписки на события шины
+    uint32_t  subs[MACRO_MAX_SUBS];
+    String    subEvts[MACRO_MAX_SUBS];
+    int       subRefs[MACRO_MAX_SUBS];
+    uint8_t   nSubs;
+
+    // Асинхронный вызов (не более одного на файл)
+    bool      asyncPending;
+    int       asyncCbRef;
 } MacroFile;
 
 /// Структура конфига — сохраняется в config_macros.json

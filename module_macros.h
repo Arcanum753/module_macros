@@ -28,6 +28,7 @@ public:
     void setFs(fs::LittleFSFS* fs);
     void begin();
     void begin(ModContext& ctx);
+    void register_resources();
     void web_Init();
 
     // Публичное API
@@ -52,6 +53,11 @@ private:
     void handlePrio(AsyncWebServerRequest *request);
     void handleReload(AsyncWebServerRequest *request);
     void handleFire(AsyncWebServerRequest *request);
+    void handleResources(AsyncWebServerRequest *request);
+    void handleValidate(AsyncWebServerRequest *request);
+    void handleSetCron(AsyncWebServerRequest *request);
+    void handleWrite(AsyncWebServerRequest *request);
+    void handleGet(AsyncWebServerRequest *request);
 
     // Конфиг
     void defaultConfig();

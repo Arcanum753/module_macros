@@ -1,25 +1,15 @@
--- Демо: правила ввода с параметрами из терминала.
--- Примеры:
---   macro run ex_input.lua
---   macro msg temp 25      - сработает term("temp 25", ...)
---   macro msg button1 on   - сработает term("button1 on", ...)
---   macro btn start        - сработает button("start", ...)
--- При совпадении параметров модуль печатает «условие ... сработало»
--- и выполняет тело правила в интерпретаторе этого файла.
-
-local function report(msg)
-    puts(clock())
-    puts(msg)
-end
-
-term("temp 25", function()
-    report("sensor: temperature 25")
-end)
-
-term("button1 on", function()
-    report("button1 is ON")
-end)
-
-button("start", function()
-    report("button start pressed")
-end)
+-- Демо: события терминала и кнопки (macro msg / macro btn).
+return {
+    desc = "term/button input demo",
+    rules = {
+        { term = "temp 25", body = function()
+            puts("sensor: temperature 25")
+        end },
+        { term = "button1 on", body = function()
+            puts("button1 on")
+        end },
+        { button = "start", body = function()
+            puts("button start pressed")
+        end },
+    }
+}

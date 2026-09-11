@@ -9,6 +9,8 @@
 #include "common_module.h"
 #include "common/common.h"
 #include "common/TimeLib.h"
+#include "core_state/core_state.h"
+#include "core_state/common_module.h"
 #include "module_macros_version.h"
 #include "core_sys/eertos.h"
 
@@ -63,11 +65,31 @@ void CLASS_MODULE_MACROS::begin() {
 
     // Периодическая задача исполнительной машины (раз в секунду)
     SetTimerTask(macroTickTask, 1000);
+
+    core_state.signal("macros.enabled", BusValue::bo(_config.enabled));
+    core_state.signal("macros.files", BusValue::i32(_fileCount));
 }
 
 void CLASS_MODULE_MACROS::begin(ModContext& ctx) {
     _fs = ctx.fs;
     begin();
+}
+
+// ============================================================
+// register_resources()
+// ============================================================
+static int macroBusReload(void* user, int argc, const BusValue* argv, BusValue& result) {
+    (void)user; (void)argc; (void)argv; (void)result;
+    module_macros.reloadAll();
+    return BUS_OK;
+}
+
+void CLASS_MODULE_MACROS::register_resources() {
+    DEBUGMACROS("%s\r\n", __FUNCTION__);
+
+    core_state.regState("enabled", BusValue::BOOL, "macros module enabled", false);
+    core_state.regState("files",   BusValue::I32,  "number of scenarios", false);
+    core_state.regFunc("reload", "->", "reload all scenarios", macroBusReload, nullptr);
 }
 
 // ============================================================
@@ -122,6 +144,36 @@ void CLASS_MODULE_MACROS::web_Init() {
     ESPHTTPServer.on("/macros/fire", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
         this->handleFire(request);
+    });
+
+    // AJAX — каталог ресурсов шины (для дерева на странице)
+    ESPHTTPServer.on("/macros/resources", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleResources(request);
+    });
+
+    // AJAX — валидация cron/синтаксиса Lua
+    ESPHTTPServer.on("/macros/validate", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleValidate(request);
+    });
+
+    // AJAX — мета-cron (гейт окна) файла
+    ESPHTTPServer.on("/macros/cron", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleSetCron(request);
+    });
+
+    // AJAX — сохранение содержимого сценария (встроенный редактор)
+    ESPHTTPServer.on("/macros/save", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleWrite(request);
+    });
+
+    // AJAX — чтение содержимого сценария
+    ESPHTTPServer.on("/macros/get", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleGet(request);
     });
 
     // Версия модуля
@@ -181,7 +233,11 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
         json += String(f.created);
         json += ",\"active\":";
         json += (f.active ? "true" : "false");
-        json += ",\"err\":\"";
+        json += ",\"cron\":\"";
+        json += escapeJson(f.metaCron);
+        json += "\",\"desc\":\"";
+        json += escapeJson(f.desc);
+        json += "\",\"err\":\"";
         json += escapeJson(f.err);
         json += "\"}";
     }
@@ -330,6 +386,112 @@ void CLASS_MODULE_MACROS::handleFire(AsyncWebServerRequest *request) {
     }
 }
 
+void CLASS_MODULE_MACROS::handleSetCron(AsyncWebServerRequest *request) {
+    DEBUGMACROS("%s\r\n", __FUNCTION__);
+
+    if (!request->hasArg("name")) {
+        request->send(200, "text/plain", "ERR: no name");
+        return;
+    }
+    String base = request->arg("name");
+    base.trim();
+    int idx = findFile(MACROS_DIR_RE + base);
+    if (idx < 0) {
+        request->send(200, "text/plain", "ERR: not found");
+        return;
+    }
+
+    String cron = request->hasArg("cron") ? request->arg("cron") : String("");
+    cron.trim();
+    if (cron.length() > 0) {
+        String errTxt;
+        if (ns_module_macros::macroCronValid(cron, errTxt) == false) {
+            request->send(200, "text/plain", String("ERR: cron: ") + errTxt);
+            return;
+        }
+    }
+    _files[idx].metaCron = cron;
+    saveConfig();
+    _scriptRev++;
+    request->send(200, "text/plain", "OK");
+}
+
+void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
+    DEBUGMACROS("%s\r\n", __FUNCTION__);
+
+    if (!request->hasArg("name") || !request->hasArg("body")) {
+        request->send(200, "text/plain", "ERR: no args");
+        return;
+    }
+    String base = request->arg("name");
+    base.trim();
+    if (nameOk(base) == false) {
+        request->send(200, "text/plain", "ERR: bad name");
+        return;
+    }
+    String body = request->arg("body");
+    if (writeFile(MACROS_DIR_RE + base, body) == false) {
+        request->send(200, "text/plain", "ERR: write failed");
+        return;
+    }
+    _scriptRev++;
+    request->send(200, "text/plain", "OK");
+}
+
+void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
+    if (!request->hasArg("name")) {
+        request->send(200, "text/plain", "");
+        return;
+    }
+    String base = request->arg("name");
+    base.trim();
+    if (nameOk(base) == false) {
+        request->send(200, "text/plain", "");
+        return;
+    }
+    request->send(200, "text/plain", readFile(MACROS_DIR_RE + base));
+}
+
+void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    core_state.catalogToJson(doc);
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+}
+
+void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
+    DEBUGMACROS("%s\r\n", __FUNCTION__);
+
+    if (request->hasArg("cron")) {
+        String errTxt;
+        if (ns_module_macros::macroCronValid(request->arg("cron"), errTxt) == false) {
+            request->send(200, "text/plain", String("ERROR: cron: ") + errTxt);
+            return;
+        }
+    }
+
+    if (request->hasArg("body")) {
+        String body = request->arg("body");
+        EspLuaEngine eng;
+        if (eng.getLuaState() == NULL) {
+            request->send(200, "text/plain", "ERROR: no memory");
+            return;
+        }
+        String cn = "@validate";
+        int status = luaL_loadbuffer(eng.getLuaState(), body.c_str(), body.length(), cn.c_str());
+        if (status != LUA_OK) {
+            size_t len = 0;
+            const char* s = lua_tolstring(eng.getLuaState(), -1, &len);
+            String e = (s != NULL) ? String(s) : String("syntax error");
+            request->send(200, "text/plain", String("ERROR: lua: ") + e);
+            return;
+        }
+    }
+
+    request->send(200, "text/plain", "OK");
+}
+
 // ============================================================
 // Конфиг
 // ============================================================
@@ -352,17 +514,27 @@ bool CLASS_MODULE_MACROS::loadConfig() {
         for (JsonObject obj : arr) {
             if (_fileCount >= MACRO_MAX_FILES) { break; }
             MacroFile& f = _files[_fileCount];
-            f.name    = obj["name"].as<String>();
-            f.prio    = obj["prio"].as<uint8_t>();
-            f.run     = obj["run"].as<bool>();
-            f.created = obj["created"].as<uint32_t>();
+            f.name     = obj["name"].as<String>();
+            f.prio     = obj["prio"].as<uint8_t>();
+            f.run      = obj["run"].as<bool>();
+            f.created  = obj["created"].as<uint32_t>();
+            f.metaCron = obj["cron"].as<String>();
             if (f.name.length() == 0) { continue; }
             f.active = false;
             f.err = "";
+            f.desc = "";
             f.lua = NULL;
             f.ctx.file = NULL;
             f.ctx.parsing = false;
             f.nEnts = 0;
+            f.nSubs = 0;
+            f.asyncPending = false;
+            f.asyncCbRef = LUA_NOREF;
+            for (uint8_t s = 0; s < MACRO_MAX_SUBS; s++) {
+                f.subs[s] = 0;
+                f.subRefs[s] = LUA_NOREF;
+                f.subEvts[s] = "";
+            }
             _fileCount++;
         }
     }
@@ -385,6 +557,7 @@ bool CLASS_MODULE_MACROS::saveConfig() {
         obj["prio"]    = _files[i].prio;
         obj["run"]     = _files[i].run;
         obj["created"] = _files[i].created;
+        obj["cron"]    = _files[i].metaCron;
     }
     return core_json.jsonFileSaveDoc(CONFIG_FILE_MACROS, doc);
 }

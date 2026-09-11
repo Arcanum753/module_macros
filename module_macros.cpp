@@ -6,6 +6,7 @@
 #include "core_terminal/ErriezSerialTerminal.h"
 
 #include "module_macros.h"
+#include "common_module.h"
 #include "common/common.h"
 #include "common/TimeLib.h"
 #include "module_macros_version.h"
@@ -27,10 +28,6 @@ CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _evOut = 0;
     _fs = NULL;
 }
-
-// Forward declarations — свободные функции, используемые логикой модуля
-static String macroJsonEscape(const String& s);
-static String macroFileBaseName(const String& pathOrName);
 
 // Периодическая 1-сек задача и терминальный обработчик объявлены здесь,
 // чтобы их можно было использовать до определений в конце файла
@@ -173,7 +170,7 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
         }
 
         json += "{\"name\":\"";
-        json += macroJsonEscape(macroFileBaseName(f.name));
+        json += escapeJson(ns_module_macros::macroFileBaseName(f.name));
         json += "\",\"prio\":";
         json += String(f.prio);
         json += ",\"run\":";
@@ -185,7 +182,7 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
         json += ",\"active\":";
         json += (f.active ? "true" : "false");
         json += ",\"err\":\"";
-        json += macroJsonEscape(f.err);
+        json += escapeJson(f.err);
         json += "\"}";
     }
 
@@ -506,7 +503,7 @@ void CLASS_MODULE_MACROS::reconcileList() {
         File entry = root.openNextFile();
         while (entry) {
             if (entry.isDirectory() == false) {
-                String base = macroFileBaseName(String(entry.name()));
+                String base = ns_module_macros::macroFileBaseName(String(entry.name()));
                 if (base.endsWith(".lua")) {
                     if (findFile(MACROS_DIR_RE + base) < 0) { addFileEntry(base, 7, false); }
                 }
@@ -673,39 +670,6 @@ void CLASS_MODULE_MACROS::printList() {
 void macroTickTask() {
     module_macros.tickStep();
     SetTimerTask(macroTickTask, 1000);
-}
-
-// ============================================================
-// Вспомогательные утилиты
-// ============================================================
-
-static String macroFileBaseName(const String& pathOrName) {
-    int slash = pathOrName.lastIndexOf('/');
-    if (slash >= 0) { return pathOrName.substring(slash + 1); }
-    return pathOrName;
-}
-
-static String macroJsonEscape(const String& s) {
-    String out;
-    for (uint8_t i = 0; i < s.length(); i++) {
-        char c = s.charAt(i);
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if ((unsigned char)c < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                    out += buf;
-                } else {
-                    out += c;
-                }
-        }
-    }
-    return out;
 }
 
 // ============================================================

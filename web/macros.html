@@ -5,15 +5,21 @@
     <meta http-equiv="Content-type" content="text/html; charset=utf-8">
     <link rel="stylesheet" href="style.css">
     <style>
-        .macros-layout { display: flex; gap: 10px; padding: 6px; align-items: stretch; height: calc(100vh - 150px); min-height: 420px; }
-        .macros-left { flex: 1 1 38%; display: flex; flex-direction: column; gap: 6px; min-width: 300px; }
-        .macros-right { flex: 1 1 62%; display: flex; flex-direction: column; gap: 6px; min-width: 320px; }
+        .macros-layout { display: flex; gap: 6px; padding: 6px; align-items: stretch; height: calc(100vh - 150px); min-height: 420px; }
+        .macros-left { flex: 0 0 38%; display: flex; flex-direction: column; gap: 6px; min-width: 200px; }
+        .macros-right { flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px; min-width: 320px; }
+        .splitter { flex: 0 0 5px; cursor: col-resize; background: #ccc; border-radius: 3px; align-self: stretch; }
+        .splitter:hover, body.split-drag .splitter { background: #7D8EE2; }
+        body.split-drag { cursor: col-resize; user-select: none; }
         .panel { border: 1px solid #bbb; background: #fff; overflow: auto; flex: 1 1 auto; }
         .panel h4 { margin: 0; padding: 4px 6px; background: #eee; border-bottom: 1px solid #ccc; font-size: 13px; }
         #macTable { width: 100%; border-collapse: collapse; font-size: 12px; }
         #macTable th, #macTable td { border-bottom: 1px solid #e0e0e0; padding: 2px 4px; text-align: left; }
+        #macTable tr.chk-sel { background: #fff7d6; }
         #macTable tr.sel { background: #dce7ff; }
         #macTable input.cron { width: 110px; font-size: 11px; }
+        #macTable button.mini { font-size: 11px; line-height: 1; padding: 1px 3px; cursor: pointer; }
+        #macTable button.mini.active { background: #7D8EE2; color: #fff; border-color: #5a6cc0; }
         .iconbar { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
         .iconbar button { cursor: pointer; }
         #resTree { font-size: 12px; padding: 2px; }
@@ -50,16 +56,19 @@
         <button onclick="actPrio(-1)">Prio -</button>
         <button onclick="actPrio(1)">Prio +</button>
         <button onclick="actDel()">Delete</button>
+        <button onclick="validateMacros()">Валидация макросов</button>
         <span id="busy"></span>
         <span id="status" style="font-size:12px;color:#555;"></span>
     </div>
+    <div id="heapInfo" style="padding: 2px 8px 6px; font-size:12px; font-family: monospace; color:#333;"></div>
 
     <div class="content">
         <div class="panel" style="max-height: 190px; flex: 0 0 auto;">
             <table id="macTable">
                 <thead>
                     <tr>
-                        <th></th><th>prio</th><th>name</th><th>cron</th>
+                        <th><input type="checkbox" id="chkAll" onclick="toggleAll(this.checked)"></th>
+                        <th>prio</th><th>start/stop</th><th>name</th><th>cron</th>
                         <th>desc</th><th>run</th><th>err</th><th>created</th>
                     </tr>
                 </thead>
@@ -79,6 +88,7 @@
                 <div id="propPanel">Click a resource to see details.</div>
             </div>
         </div>
+        <div class="splitter" id="splitter" title="Перетащите, чтобы изменить ширину"></div>
         <div class="macros-right">
             <div class="iconbar">
                 <span id="editName" style="font-size:12px;color:#555;">(no file)</span>
@@ -103,6 +113,7 @@
     <script src="GetMarkup.js" defer></script>
     <script>
         let SEL = new Set();
+        let CUR_EDIT = null;
         let EDITOR_AVAILABLE = false;
         let CUR_TREE = {};
 
@@ -127,7 +138,22 @@
                 chk.onclick = (e) => { e.stopPropagation(); toggleSel(f.name, chk.checked); };
                 const td0 = document.createElement('td'); td0.appendChild(chk);
                 tr.appendChild(td0);
-                tr.insertAdjacentHTML('beforeend', '<td>' + f.prio + '</td><td>' + esc(f.name) + '</td>');
+                tr.insertAdjacentHTML('beforeend', '<td>' + f.prio + '</td>');
+
+                // Колонка start/stop: две кнопки, активная подсвечена
+                const tdRun = document.createElement('td');
+                const bStart = document.createElement('button');
+                bStart.textContent = '\u25B6'; bStart.title = 'start';
+                bStart.className = 'mini' + (f.run ? ' active' : '');
+                bStart.onclick = (e) => { e.stopPropagation(); setRun(f.name, 1); };
+                const bStop = document.createElement('button');
+                bStop.textContent = '\u25A0'; bStop.title = 'stop';
+                bStop.className = 'mini' + (f.run ? '' : ' active');
+                bStop.onclick = (e) => { e.stopPropagation(); setRun(f.name, 0); };
+                tdRun.appendChild(bStart); tdRun.appendChild(bStop);
+                tr.appendChild(tdRun);
+
+                tr.insertAdjacentHTML('beforeend', '<td>' + esc(f.name) + '</td>');
                 const tdCron = document.createElement('td');
                 const inp = document.createElement('input'); inp.className = 'cron'; inp.value = f.cron || '';
                 inp.onclick = (e) => e.stopPropagation();
@@ -138,6 +164,7 @@
                     '<td>' + (f.run ? 'on' : 'off') + '</td>' +
                     '<td title="' + esc(f.err) + '">' + (f.err ? '!' : '') + '</td>' +
                     '<td>' + fmtDate(f.created) + '</td>');
+                if (f.name === CUR_EDIT) { tr.classList.add('sel'); }
                 tr.onclick = () => selectRow(tr, f.name);
                 tr.ondblclick = () => actEdit();
                 body.appendChild(tr);
@@ -145,19 +172,71 @@
             syncSelUi();
         }
 
+        async function setRun(name, on) {
+            await api('/macros/state?name=' + encodeURIComponent(name) + '&on=' + on);
+            refresh();
+        }
+
+        // Валидация бюджета heap модуля: сервер оценивает занятую память
+        // (файлы + правила + Lua + каталог) и сравнивает с лимитом.
+        async function validateMacros() {
+            const info = document.getElementById('heapInfo');
+            info.style.color = '#333';
+            info.innerText = 'Расчёт...';
+            try {
+                const r = await fetch('/macros/heap', { cache: 'no-store' }).then(x => x.json());
+                const kb = v => (v / 1024).toFixed(1);
+                let msg = 'heap: ' + kb(r.used) + ' / ' + kb(r.budget) + ' КБ (' + r.percent + '% от бюджета)';
+                msg += '  |  файлов: ' + r.files + ' (активных ' + r.active + '), правил: ' + r.rules;
+                msg += '  |  lua: ' + kb(r.lua) + ' КБ, каталог: ' + kb(r.catalog) + ' КБ';
+                msg += '  |  free: ' + kb(r.free) + ' КБ';
+                if (r.critical) {
+                    info.style.color = '#c00000';
+                    info.innerText = 'КРИТИЧНО! >' + r.limit + '% бюджета. ' + msg;
+                } else {
+                    info.style.color = '#1a7f1a';
+                    info.innerText = 'OK. ' + msg;
+                }
+            } catch (e) {
+                info.style.color = '#c00000';
+                info.innerText = 'Ошибка валидации: ' + e;
+            }
+        }
+
+        // SEL — множество чекбоксов для групповых действий.
+        // CUR_EDIT — файл, открытый в редакторе. Это независимые состояния.
         function toggleSel(name, on) { if (on) { SEL.add(name); } else { SEL.delete(name); } syncSelUi(); }
         function selectRow(tr, name) {
             document.querySelectorAll('#macBody tr').forEach(r => r.classList.remove('sel'));
             tr.classList.add('sel');
-            SEL = new Set([name]);
-            syncSelUi();
+            CUR_EDIT = name;
             openFile(name);
         }
         function syncSelUi() {
-            const chk = document.querySelectorAll('#macBody input[type=checkbox]');
-            chk.forEach(c => { c.checked = SEL.has(c.closest('tr').dataset.name); });
+            let all = true;
+            let none = true;
+            document.querySelectorAll('#macBody tr').forEach(function (tr) {
+                const on = SEL.has(tr.dataset.name);
+                const c = tr.querySelector('input[type=checkbox]');
+                if (c) { c.checked = on; }
+                tr.classList.toggle('chk-sel', on);
+                if (on) { none = false; } else { all = false; }
+            });
+            const hdr = document.getElementById('chkAll');
+            if (hdr) { hdr.checked = all; hdr.indeterminate = (!all && !none); }
         }
-        function firstSelected() { return SEL.size ? SEL.values().next().value : null; }
+        function toggleAll(on) {
+            SEL.clear();
+            if (on) {
+                document.querySelectorAll('#macBody tr').forEach(function (tr) { SEL.add(tr.dataset.name); });
+            }
+            syncSelUi();
+        }
+        function firstSelected() {
+            if (SEL.size === 1) { return SEL.values().next().value; }
+            if (SEL.size === 0) { return CUR_EDIT; }
+            return null;
+        }
 
         async function actCreate() {
             const r = await api('/macros/create?name=new_macros.lua');
@@ -275,8 +354,7 @@
         function insertSnippet(r) {
             const ta = document.getElementById('lua');
             let s;
-            if (r.f && r.a) { s = 'call_async("' + r.full + '", function(rc, v)\n    -- rc, v\nend)'; }
-            else if (r.f) { s = 'call("' + r.full + '")'; }
+            if (r.f) { s = (r.a ? '-- async: вызывается движком, без callback\n' : '') + 'call("' + r.full + '")'; }
             else { s = 'get("' + r.full + '")'; }
             const p = ta.selectionStart;
             ta.value = ta.value.slice(0, p) + s + ta.value.slice(ta.selectionEnd);
@@ -284,10 +362,48 @@
             ta.focus(); onEdit();
         }
 
+        // ---- Подвижный разделитель панелей ----
+        let _splitDrag = false;
+        function initSplitter() {
+            const layout = document.querySelector('.macros-layout');
+            const left = document.querySelector('.macros-left');
+            const split = document.getElementById('splitter');
+            if (!layout || !left || !split) { return; }
+
+            const saved = parseInt(localStorage.getItem('macros_left_width'), 10);
+            if (saved > 0) { left.style.flex = '0 0 ' + saved + 'px'; }
+
+            split.addEventListener('mousedown', function (e) {
+                _splitDrag = true;
+                document.body.classList.add('split-drag');
+                e.preventDefault();
+            });
+            document.addEventListener('mousemove', function (e) {
+                if (!_splitDrag) { return; }
+                const r = layout.getBoundingClientRect();
+                let w = e.clientX - r.left;
+                const max = Math.max(200, r.width - 320);
+                if (w < 200) { w = 200; }
+                if (w > max) { w = max; }
+                left.style.flex = '0 0 ' + w + 'px';
+            });
+            document.addEventListener('mouseup', function () {
+                if (!_splitDrag) { return; }
+                _splitDrag = false;
+                document.body.classList.remove('split-drag');
+                localStorage.setItem('macros_left_width', String(Math.round(left.getBoundingClientRect().width)));
+            });
+            split.addEventListener('dblclick', function () {
+                left.style.flex = '0 0 38%';
+                localStorage.removeItem('macros_left_width');
+            });
+        }
+
         window.onload = function() {
             setTimeout(() => {
                 ApplyCVT("/system/version").then(() => ApplyCVT("/macros/ver"));
             }, 500);
+            initSplitter();
             refresh();
             loadResources();
         };

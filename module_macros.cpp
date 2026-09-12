@@ -17,24 +17,61 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
 
 CLASS_MODULE_MACROS module_macros;
 
 CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _fileCount = 0;
-    _metaRev = 0;
-    _scriptRev = 0;
-    _lastScriptRev = 0;
     _ntpWasSynced = false;
     _evIn = 0;
     _evOut = 0;
     _fs = NULL;
+    _files = NULL;
+    _lua = NULL;
+    _luaHeapBytes = 0;
+    _nEvtSubs = 0;
+    _resourcesReady = false;
 }
 
 // Периодическая 1-сек задача и терминальный обработчик объявлены здесь,
 // чтобы их можно было использовать до определений в конце файла
 void macroTickTask();
 void macroCmd();
+
+// Полный сброс одного слота файла: массив _files лежит в heap и не
+// обнуляется автоматически, поэтому каждое использование слота начинается
+// с этой инициализации.
+static void resetMacroFile(MacroFile& f) {
+    f.name = "";
+    f.prio = 7;
+    f.run = false;
+    f.created = 0;
+    f.metaCron = "";
+    f.size = 0;
+    f.active = false;
+    f.err = "";
+    f.desc = "";
+    f.needParse = false;
+    f.parseFails = 0;
+    f.rules = NULL;
+    f.nRules = 0;
+    memset(&f.metaExpr, 0, sizeof(cron_expr));
+    f.metaValid = false;
+    f.metaInit = false;
+    f.metaNext = 0;
+}
+
+// Обновляет кэш размера файла (чтобы /macros/list не открывал файлы на каждый запрос).
+static void updateMacroFileSize(fs::LittleFSFS* fs, MacroFile& f) {
+    f.size = 0;
+    if (fs == NULL) { return; }
+    File sf = fs->open(f.name, "r");
+    if (sf) {
+        f.size = (uint32_t)sf.size();
+        sf.close();
+    }
+}
 
 // ============================================================
 // setFs()
@@ -49,19 +86,32 @@ void CLASS_MODULE_MACROS::setFs(fs::LittleFSFS* fs) {
 void CLASS_MODULE_MACROS::begin() {
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
+    // Массив файлов выделяется в heap (static .bss для 25 слотов не влезает в DRAM).
+    if (_files == NULL) {
+        _files = new (std::nothrow) MacroFile[MACRO_MAX_FILES];
+        if (_files == NULL) {
+            DEBUGMACROS("%s: no memory for %d file slots\r\n", __FUNCTION__, MACRO_MAX_FILES);
+            return;
+        }
+    }
+
     defaultConfig();
     if (loadConfig() == false) { saveConfig(); }
 
     ensureMacrosDir();
     reconcileList();
 
+    // Кэшируем размеры файлов один раз при старте (для /macros/list).
+    for (uint8_t i = 0; i < _fileCount; i++) { updateMacroFileSize(_fs, _files[i]); }
+
     TerminalRegisterModule(macroTerminalRegister);
 
     // Первичная сборка интерпретаторов запущенных файлов выполняется в setup()
-    // (main-loop контекст, до старта веб-сервера), чтобы tick не делал это дважды.
-    _scriptRev = 1;
-    rebuildScripts();
-    _lastScriptRev = _scriptRev;
+    // (main-loop контекст, до старта веб-сервера). Помечаем все run-файлы и
+    // разбираем их пакетами (не более MACRO_PARSE_PER_TICK за вызов), чтобы
+    // не создавать лавину Lua-состояний и не фрагментировать хип.
+    markAllDirty();
+    while (anyNeedParse()) { rebuildScripts(); }
 
     // Периодическая задача исполнительной машины (раз в секунду)
     SetTimerTask(macroTickTask, 1000);
@@ -158,6 +208,12 @@ void CLASS_MODULE_MACROS::web_Init() {
         this->handleValidate(request);
     });
 
+    // AJAX — оценка heap модуля (валидация бюджета макросов)
+    ESPHTTPServer.on("/macros/heap", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleHeap(request);
+    });
+
     // AJAX — мета-cron (гейт окна) файла
     ESPHTTPServer.on("/macros/cron", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
@@ -186,12 +242,18 @@ void CLASS_MODULE_MACROS::web_Init() {
 // Веб-обработчики
 // ============================================================
 void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
+    // Защита от OOM в AsyncTCP: без запаса heap не строим ответ.
+    if (ESP.getMaxAllocHeap() < 6000) {
+        request->send(503, "text/plain", "ERR: low memory");
+        return;
+    }
 
-    String json = "{\"enabled\":";
-    json += (_config.enabled ? "true" : "false");
-    json += ",\"ntp\":";
-    json += (NTP.getLastNTPSync() > 0) ? "1" : "0";
-    json += ",\"files\":[";
+    AsyncResponseStream *resp = request->beginResponseStream("application/json");
+    resp->print("{\"enabled\":");
+    resp->print(_config.enabled ? "true" : "false");
+    resp->print(",\"ntp\":");
+    resp->print((NTP.getLastNTPSync() > 0) ? "1" : "0");
+    resp->print(",\"files\":[");
 
     // Сортировка по приоритету (0 - высший), затем по имени
     uint8_t order[MACRO_MAX_FILES];
@@ -212,38 +274,31 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
 
     for (uint8_t n = 0; n < _fileCount; n++) {
         MacroFile& f = _files[order[n]];
-        if (n > 0) { json += ","; }
+        if (n > 0) { resp->print(","); }
 
-        size_t size = 0;
-        File sf = _fs->open(f.name, "r");
-        if (sf) {
-            size = sf.size();
-            sf.close();
-        }
-
-        json += "{\"name\":\"";
-        json += escapeJson(ns_module_macros::macroFileBaseName(f.name));
-        json += "\",\"prio\":";
-        json += String(f.prio);
-        json += ",\"run\":";
-        json += (f.run ? "true" : "false");
-        json += ",\"size\":";
-        json += String((uint32_t)size);
-        json += ",\"created\":";
-        json += String(f.created);
-        json += ",\"active\":";
-        json += (f.active ? "true" : "false");
-        json += ",\"cron\":\"";
-        json += escapeJson(f.metaCron);
-        json += "\",\"desc\":\"";
-        json += escapeJson(f.desc);
-        json += "\",\"err\":\"";
-        json += escapeJson(f.err);
-        json += "\"}";
+        resp->print("{\"name\":\"");
+        resp->print(escapeJson(ns_module_macros::macroFileBaseName(f.name)));
+        resp->print("\",\"prio\":");
+        resp->print(f.prio);
+        resp->print(",\"run\":");
+        resp->print(f.run ? "true" : "false");
+        resp->print(",\"size\":");
+        resp->print(f.size);
+        resp->print(",\"created\":");
+        resp->print(f.created);
+        resp->print(",\"active\":");
+        resp->print(f.active ? "true" : "false");
+        resp->print(",\"cron\":\"");
+        resp->print(escapeJson(f.metaCron));
+        resp->print("\",\"desc\":\"");
+        resp->print(escapeJson(f.desc));
+        resp->print("\",\"err\":\"");
+        resp->print(escapeJson(f.err));
+        resp->print("\"}");
     }
 
-    json += "]}";
-    request->send(200, "application/json", json);
+    resp->print("]}");
+    request->send(resp);
 }
 
 void CLASS_MODULE_MACROS::handleCreate(AsyncWebServerRequest *request) {
@@ -353,8 +408,9 @@ void CLASS_MODULE_MACROS::handleReload(AsyncWebServerRequest *request) {
         base.trim();
         int idx = findFile(MACROS_DIR_RE + base);
         if (idx >= 0) {
-            // Пересборка произойдёт в tick (перезапуск файла)
-            _scriptRev++;
+            // Пересборка только этого файла в ближайшем тике
+            _files[idx].parseFails = 0;
+            _files[idx].needParse = true;
             request->send(200, "text/plain", "OK");
             return;
         }
@@ -372,11 +428,11 @@ void CLASS_MODULE_MACROS::handleFire(AsyncWebServerRequest *request) {
         request->send(200, "text/plain", "ERR: no token");
         return;
     }
-    uint8_t type = MACRO_ENT_TERM;
+    uint8_t type = MACRO_RULE_TERM;
     if (request->hasArg("type")) {
         String t = request->arg("type");
-        if (t == "button") { type = MACRO_ENT_BUTTON; }
-        else if (t == "term") { type = MACRO_ENT_TERM; }
+        if (t == "button") { type = MACRO_RULE_BUTTON; }
+        else if (t == "term") { type = MACRO_RULE_TERM; }
     }
     String token = request->arg("token");
     if (fireToken(type, token)) {
@@ -412,7 +468,8 @@ void CLASS_MODULE_MACROS::handleSetCron(AsyncWebServerRequest *request) {
     }
     _files[idx].metaCron = cron;
     saveConfig();
-    _scriptRev++;
+    _files[idx].parseFails = 0;
+    _files[idx].needParse = true;
     request->send(200, "text/plain", "OK");
 }
 
@@ -434,7 +491,12 @@ void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
         request->send(200, "text/plain", "ERR: write failed");
         return;
     }
-    _scriptRev++;
+    int idx = findFile(MACROS_DIR_RE + base);
+    if (idx >= 0) {
+        _files[idx].parseFails = 0;
+        _files[idx].needParse = true;
+        updateMacroFileSize(_fs, _files[idx]);
+    }
     request->send(200, "text/plain", "OK");
 }
 
@@ -453,11 +515,26 @@ void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
-    JsonDocument doc;
-    core_state.catalogToJson(doc);
-    String out;
-    serializeJson(doc, out);
-    request->send(200, "application/json", out);
+    // Каталог ресурсов статичен после старта: собираем один раз (пока heap высок)
+    // и стримим из памяти, без JsonDocument и аллокаций на каждый запрос.
+    if (ESP.getMaxAllocHeap() < 8000) {
+        request->send(503, "text/plain", "ERR: low memory");
+        return;
+    }
+    if (_resourcesReady == false) {
+        JsonDocument doc;
+        core_state.catalogToJson(doc);
+        if (doc.overflowed()) {
+            request->send(500, "text/plain", "ERR: catalog too large");
+            return;
+        }
+        _resourcesJson = "";
+        serializeJson(doc, _resourcesJson);
+        _resourcesReady = true;
+    }
+    AsyncResponseStream *resp = request->beginResponseStream("application/json");
+    resp->print(_resourcesJson);
+    request->send(resp);
 }
 
 void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
@@ -492,6 +569,68 @@ void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "OK");
 }
 
+// Оценка heap, занятого модулем: массив файлов + правила (со строками) +
+// единый lua_State + кэш каталога ресурсов. Служит для проверки бюджета.
+size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
+    size_t total = 0;
+
+    if (_files != NULL) {
+        total += sizeof(MacroFile) * MACRO_MAX_FILES; // выделено под весь лимит файлов
+        for (uint8_t i = 0; i < _fileCount; i++) {
+            MacroFile& f = _files[i];
+            total += f.name.length() + 1;
+            total += f.metaCron.length() + 1;
+            total += f.desc.length() + 1;
+            total += f.err.length() + 1;
+            if (f.rules == NULL) { continue; }
+            total += sizeof(MacroRule) * f.nRules;
+            for (uint8_t j = 0; j < f.nRules; j++) {
+                MacroRule& r = f.rules[j];
+                total += r.spec.length() + 1;
+                total += r.condSpec.length() + 1;
+                total += r.lastVal.length() + 1;
+                total += r.handler.length() + 1;
+                total += r.handlerArgs.length() + 1;
+                for (uint8_t a = 0; a < r.nActions; a++) {
+                    total += r.actions[a].length() + 1;
+                }
+            }
+        }
+    }
+
+    total += _luaHeapBytes;                  // единый интерпретатор
+    total += _resourcesJson.length() + 1;    // кэш каталога ресурсов
+    for (uint8_t i = 0; i < _nEvtSubs; i++) { total += _evtSubs[i].name.length() + 1; }
+    return total;
+}
+
+void CLASS_MODULE_MACROS::handleHeap(AsyncWebServerRequest *request) {
+    size_t used = estimateHeapBytes();
+    uint32_t pct = (uint32_t)((used * 100) / MACRO_HEAP_BUDGET);
+    bool critical = (pct >= MACRO_HEAP_CRIT_PCT);
+    uint8_t active = 0;
+    uint16_t rules = 0;
+    for (uint8_t i = 0; i < _fileCount; i++) {
+        if (_files[i].active) { active++; rules += _files[i].nRules; }
+    }
+
+    AsyncResponseStream *resp = request->beginResponseStream("application/json");
+    resp->print("{\"budget\":");   resp->print((uint32_t)MACRO_HEAP_BUDGET);
+    resp->print(",\"used\":");     resp->print((uint32_t)used);
+    resp->print(",\"free\":");     resp->print((uint32_t)ESP.getFreeHeap());
+    resp->print(",\"maxalloc\":"); resp->print((uint32_t)ESP.getMaxAllocHeap());
+    resp->print(",\"percent\":");  resp->print(pct);
+    resp->print(",\"limit\":");    resp->print((uint32_t)MACRO_HEAP_CRIT_PCT);
+    resp->print(",\"critical\":"); resp->print(critical ? "true" : "false");
+    resp->print(",\"files\":");    resp->print(_fileCount);
+    resp->print(",\"active\":");   resp->print(active);
+    resp->print(",\"rules\":");    resp->print(rules);
+    resp->print(",\"lua\":");      resp->print((uint32_t)_luaHeapBytes);
+    resp->print(",\"catalog\":");  resp->print((uint32_t)_resourcesJson.length());
+    resp->print("}");
+    request->send(resp);
+}
+
 // ============================================================
 // Конфиг
 // ============================================================
@@ -514,27 +653,13 @@ bool CLASS_MODULE_MACROS::loadConfig() {
         for (JsonObject obj : arr) {
             if (_fileCount >= MACRO_MAX_FILES) { break; }
             MacroFile& f = _files[_fileCount];
+            resetMacroFile(f);
             f.name     = obj["name"].as<String>();
+            if (f.name.length() == 0) { continue; }
             f.prio     = obj["prio"].as<uint8_t>();
             f.run      = obj["run"].as<bool>();
             f.created  = obj["created"].as<uint32_t>();
             f.metaCron = obj["cron"].as<String>();
-            if (f.name.length() == 0) { continue; }
-            f.active = false;
-            f.err = "";
-            f.desc = "";
-            f.lua = NULL;
-            f.ctx.file = NULL;
-            f.ctx.parsing = false;
-            f.nEnts = 0;
-            f.nSubs = 0;
-            f.asyncPending = false;
-            f.asyncCbRef = LUA_NOREF;
-            for (uint8_t s = 0; s < MACRO_MAX_SUBS; s++) {
-                f.subs[s] = 0;
-                f.subRefs[s] = LUA_NOREF;
-                f.subEvts[s] = "";
-            }
             _fileCount++;
         }
     }
@@ -606,9 +731,15 @@ bool CLASS_MODULE_MACROS::nameOk(const String& name) {
     return true;
 }
 
+void CLASS_MODULE_MACROS::markAllDirty() {
+    for (uint8_t i = 0; i < _fileCount; i++) {
+        if (_files[i].run) { _files[i].needParse = true; _files[i].parseFails = 0; }
+    }
+}
+
 void CLASS_MODULE_MACROS::bumpMeta() {
-    _metaRev++;
-    _scriptRev++;
+    // Полная перерегистрация: помечаем все запущенные файлы (create/delete/rename/reloadAll)
+    markAllDirty();
 }
 
 String CLASS_MODULE_MACROS::readFile(const String& path) {
@@ -664,8 +795,10 @@ void CLASS_MODULE_MACROS::reconcileList() {
     // 1) Удаляем записи, файлы которых пропали
     for (int i = (int)_fileCount - 1; i >= 0; i--) {
         if (_fs->exists(_files[i].name) == false) {
-            destroyScript(_files[i]);
+            unregisterFile(_files[i]);
             for (int j = i; j < (int)_fileCount - 1; j++) { _files[j] = _files[j + 1]; }
+            // Слот за пределами _fileCount может хранить дубликат указателя rules —
+            // не освобождаем его (владелец — перемещённая запись), обнуляем при переиспользовании.
             _fileCount--;
         }
     }
@@ -678,7 +811,14 @@ void CLASS_MODULE_MACROS::reconcileList() {
             if (entry.isDirectory() == false) {
                 String base = ns_module_macros::macroFileBaseName(String(entry.name()));
                 if (base.endsWith(".lua")) {
-                    if (findFile(MACROS_DIR_RE + base) < 0) { addFileEntry(base, 7, false); }
+                    if (findFile(MACROS_DIR_RE + base) < 0) {
+                        if (_fileCount >= MACRO_MAX_FILES) {
+                            DEBUGMACROS("%s: limit %d reached, skipping %s\r\n",
+                                        __FUNCTION__, MACRO_MAX_FILES, base.c_str());
+                        } else {
+                            addFileEntry(base, 7, false);
+                        }
+                    }
                 }
             }
             entry = root.openNextFile();
@@ -700,16 +840,15 @@ bool CLASS_MODULE_MACROS::addFileEntry(const String& base, uint8_t prio, bool ru
     if (_fileCount >= MACRO_MAX_FILES) { return false; }
 
     MacroFile& f = _files[_fileCount];
+    // Слот массива лежит в heap и мог использоваться ранее — сбрасываем все
+    // поля, чтобы новый файл не унаследовал мету/подписки предыдущего.
+    resetMacroFile(f);
     f.name    = path;
     f.prio    = (prio > 7) ? 7 : prio;
     f.run     = run;
     f.created = (uint32_t)now();
-    f.active  = false;
-    f.err     = "";
-    f.lua     = NULL;
-    f.ctx.file = &f;
-    f.ctx.parsing = false;
-    f.nEnts   = 0;
+    f.needParse = run;
+    updateMacroFileSize(_fs, f);
     _fileCount++;
     return true;
 }
@@ -740,7 +879,7 @@ bool CLASS_MODULE_MACROS::deleteFileEntry(const String& base) {
 
     if (_fs->exists(path)) { _fs->remove(path); }
 
-    destroyScript(_files[idx]);
+    unregisterFile(_files[idx]);
     for (int j = idx; j < (int)_fileCount - 1; j++) { _files[j] = _files[j + 1]; }
     _fileCount--;
     saveConfig();
@@ -757,10 +896,13 @@ bool CLASS_MODULE_MACROS::setFileRun(const String& base, bool on) {
         _files[idx].run = on;
         if (on == false) {
             _files[idx].err = "";
-            destroyScript(_files[idx]);
+            unregisterFile(_files[idx]);
+        } else {
+            // Регистрация правил только этого файла в ближайшем тике
+            _files[idx].parseFails = 0;
+            _files[idx].needParse = true;
         }
         saveConfig();
-        bumpMeta();
     }
     return true;
 }
@@ -807,7 +949,7 @@ bool CLASS_MODULE_MACROS::reloadAll() {
 
 bool CLASS_MODULE_MACROS::fireToken(uint8_t type, const String& spec) {
     if (spec.length() == 0) { return false; }
-    if (type != MACRO_ENT_TERM && type != MACRO_ENT_BUTTON) { return false; }
+    if (type != MACRO_RULE_TERM && type != MACRO_RULE_BUTTON && type != MACRO_RULE_EVENT) { return false; }
     uint8_t next = (uint8_t)((_evIn + 1) % MACRO_EV_QUEUE);
     if (next == _evOut) { return false; } // очередь заполнена
     _evQueue[_evIn].type = type;
@@ -824,13 +966,13 @@ void CLASS_MODULE_MACROS::printList() {
     Serial.printf("[MACRO] enabled: %d, files: %d\r\n", _config.enabled, _fileCount);
     for (uint8_t i = 0; i < _fileCount; i++) {
         MacroFile& f = _files[i];
-        Serial.printf("  [%d] prio=%d run=%d active=%d %s (%d ent)%s%s\r\n",
+        Serial.printf("  [%d] prio=%d run=%d active=%d %s (%d rules)%s%s\r\n",
                       i,
                       f.prio,
                       f.run ? 1 : 0,
                       f.active ? 1 : 0,
                       f.name.c_str(),
-                      f.nEnts,
+                      f.nRules,
                       f.err.length() > 0 ? " err=" : "",
                       f.err.c_str());
     }
@@ -863,10 +1005,11 @@ void macroCmd() {
             Serial.println("[MACRO] reload requested");
             return;
         }
-        // Перезапуск одного файла (пересборка произойдёт в tick)
+        // Перезапуск одного файла (пересборка в ближайшем тике)
         int idx = module_macros.findFile(String(MACROS_DIR_RE) + name);
         if (idx >= 0) {
-            module_macros._scriptRev++;
+            module_macros._files[idx].parseFails = 0;
+            module_macros._files[idx].needParse = true;
             Serial.println("[MACRO] reload requested for " + name);
         } else {
             Serial.println("[MACRO] not found");
@@ -900,8 +1043,8 @@ void macroCmd() {
         return;
     }
     if (arg == "msg" || arg == "btn") {
-        uint8_t type = (arg == "msg") ? MACRO_ENT_TERM : MACRO_ENT_BUTTON;
-        const char* what = (type == MACRO_ENT_TERM) ? "term" : "button";
+        uint8_t type = (arg == "msg") ? MACRO_RULE_TERM : MACRO_RULE_BUTTON;
+        const char* what = (type == MACRO_RULE_TERM) ? "term" : "button";
 
         // Собираем ВСЕ слова аргументов в одну строку (спецификатор с параметрами)
         String spec;

@@ -1,9 +1,10 @@
--- Демо: cron каждые 30 секунд.
+-- Демо: одна иголочка = один cron (в мета-конфиге).
 return {
     desc = "every 30s",
+    handlers = {
+        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
+    },
     rules = {
-        { cron = "*/30 * * * * *", body = function()
-            puts(clock(), "fired: every 30 seconds")
-        end },
-    }
+        { run = "tick" },
+    },
 }

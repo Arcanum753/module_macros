@@ -1,9 +1,10 @@
--- Демо: конкретные минута и секунда (каждый час в 00:42:15).
+-- Демо: одна иголочка = один cron (в мета-конфиге).
 return {
     desc = "at 42:15 every hour",
+    handlers = {
+        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
+    },
     rules = {
-        { cron = "15 42 * * * *", body = function()
-            puts(clock(), "fired: hourly at 42:15")
-        end },
-    }
+        { run = "tick" },
+    },
 }

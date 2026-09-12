@@ -2,8 +2,8 @@
 #define _MODULE_MACROS_ENGINE_h
 
 // ============================================================
-// module_macros_engine.h — данные и интерфейс исполнительной машины
-// сценариев (Lua 5.4 через EspLuaEngine + cron/ccronexpr).
+// module_macros_engine.h — данные и интерфейс «барабана» сценариев:
+// один Lua-интерпретатор + декларативные правила (cron/cond/term/button/on/body).
 // Реализация: module_macros_engine.cpp
 // ============================================================
 
@@ -12,49 +12,75 @@
 #include "ccronexpr.h"
 #include "EspLuaEngine/EspLuaEngine.h"
 
-// Ограничения прототипа (модуль предназначен только для ESP32)
-#define MACRO_MAX_FILES       16     ///< максимум файлов-сценариев в списке
-#define MACRO_MAX_ENTS        24     ///< максимум сущностей в одном файле
-#define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button)
-#define MACRO_MAX_SUBS        8      ///< максимум подписок на события шины на файл
+// Ограничения (модуль предназначен только для ESP32).
+// Бюджет heap модуля — MACRO_HEAP_BUDGET (100 КБ). Оценка: фиксированная
+// часть (~33 КБ: один lua_State, MacroFile[30], кэш каталога, транзиент) плюс
+// правила (sizeof(MacroRule) ~192 Б + строки на heap). Проверка — /macros/heap.
+#define MACRO_MAX_FILES       30     ///< максимум файлов-сценариев в списке
+#define MACRO_MAX_RULES       8      ///< максимум правил в одном файле
+#define MACRO_MAX_ACTIONS     4      ///< максимум bus-вызовов в одном правиле
+#define MACRO_CALL_MAX_ARGS   4      ///< максимум аргументов одного вызова
+#define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button/on)
+#define MACRO_MAX_EVENT_SUBS  8      ///< максимум уникальных событий шины в подписке
 
-// Защита от «зависаний» сценария: счётчик VM-инструкций Lua (аналог
-// старого лимита TCL_MAX_STEPS=100000 в pTcl).
+#define MACRO_HEAP_BUDGET     (100UL * 1024) ///< бюджет heap модуля, байт
+#define MACRO_HEAP_CRIT_PCT   95             ///< критический порог, % от бюджета
+
+// Защита от «зависаний» сценария: счётчик VM-инструкций Lua.
 #define MACRO_LUA_MAX_OPS     100000 ///< максимум инструкций Lua на один вызов
 #define MACRO_LUA_HOOK_N      1000   ///< шаг срабатывания count-hook (инструкций)
 
-/// Типы сущностей сценария
-#define MACRO_ENT_CRON        0      ///< «момент времени» по cron-выражению
-#define MACRO_ENT_COND        1      ///< «условие» по фронту false->true
-#define MACRO_ENT_BUTTON      2      ///< событие с веб-страницы / внешнего вызова (macro btn)
-#define MACRO_ENT_TERM        3      ///< событие из терминала (macro msg)
-#define MACRO_ENT_BODY        4      ///< просто тело (bare function) — исполняется по мета-cron
+// Регистрация правил: не более N файлов за тик и не более M авто-повторов.
+#define MACRO_PARSE_PER_TICK  2      ///< максимум регистраций за тик
+#define MACRO_PARSE_MAX_RETRY 3      ///< максимум авто-повторов после OOM
 
-/// Внешнее событие (очередь term/button)
+// Минимальная «правдоподобная» метка времени создания файла (2001-09-09).
+#define MACRO_CREATED_MIN     1000000000UL
+
+/// Типы правил
+#define MACRO_RULE_CRON       0      ///< момент времени по cron-выражению
+#define MACRO_RULE_COND       1      ///< условие (ресурс+оператор+значение), фронт false->true
+#define MACRO_RULE_BUTTON     2      ///< кнопка с веб-страницы (macro btn)
+#define MACRO_RULE_TERM       3      ///< команда терминала (macro msg)
+#define MACRO_RULE_BODY       4      ///< тело без when (по открытию мета-окна)
+#define MACRO_RULE_EVENT      5      ///< событие ресурсной шины (on="...")
+
+/// Операторы условия cond
+#define MACRO_COND_EQ         0
+#define MACRO_COND_NE         1
+#define MACRO_COND_LT         2
+#define MACRO_COND_LE         3
+#define MACRO_COND_GT         4
+#define MACRO_COND_GE         5
+#define MACRO_COND_CHANGED    6
+
+/// Внешнее событие (очередь term/button/on)
 typedef struct {
-    uint8_t type;            ///< MACRO_ENT_BUTTON или MACRO_ENT_TERM
-    String  spec;            ///< спецификатор (может содержать несколько слов-параметров)
+    uint8_t type;            ///< MACRO_RULE_BUTTON / MACRO_RULE_TERM / MACRO_RULE_EVENT
+    String  spec;            ///< спецификатор (слова term/button или имя события)
 } MacroEvent;
 
-struct MacroFile;
-
-/// Контекст разбора/исполнения Lua-файла. Указатель на этот контекст
-/// передаётся в команды сценария как userdata-upvalue (см. macroLuaReg*).
+/// Одно правило файла (декларативное)
 typedef struct {
-    struct MacroFile* file;  ///< файл, которому принадлежит интерпретатор
-    bool parsing;            ///< true — идёт разбор файла (регистрация сущностей)
-} LuaMacroCtx;
-
-/// Одна сущность сценария (строка «таблицы условий и моментов времени»)
-typedef struct {
-    uint8_t   type;          ///< MACRO_ENT_*
-    String    spec;          ///< cron-выражение / слова term|button (для cond не используется)
-    int       bodyRef;       ///< ссылка LUA_REGISTRYINDEX на функцию-тело
-    int       condRef;       ///< ссылка LUA_REGISTRYINDEX на условие (только MACRO_ENT_COND), иначе LUA_NOREF
-    cron_expr expr;          ///< разобранное cron-выражение (для MACRO_ENT_CRON)
+    uint8_t   type;          ///< MACRO_RULE_*
+    String    spec;          ///< cron / term / button / имя события
+    cron_expr expr;          ///< разобранный cron (для MACRO_RULE_CRON)
     time_t    next;          ///< следующее срабатывание cron (0 — не инициализировано)
-    bool      lastCond;      ///< предыдущее состояние условия (для MACRO_ENT_COND)
-} MacroEntity;
+    bool      lastCond;      ///< прошлое состояние (фронт для cond/body)
+
+    // Условие: сериализованная цепочка "res|op|val" через ';' (AND)
+    String    condSpec;
+    String    lastVal;       ///< прошлое значение (для op=changed)
+    bool      haveLast;
+
+    // Действие: либо handler (Lua), либо декларативные bus-вызовы
+    String    handler;       ///< run="имя" (пусто — декларативные calls)
+    String    handlerArgs;   ///< сериализованные аргументы handler "i:1|s:foo"
+    String    actions[MACRO_MAX_ACTIONS]; ///< "ns.func|i:1|s:foo"
+    uint8_t   nActions;
+
+    uint32_t  sub;           ///< подписка на событие шины (только MACRO_RULE_EVENT)
+} MacroRule;
 
 /// Файл-сценарий: метаданные (сохраняются в JSON) + runtime-состояние
 typedef struct MacroFile {
@@ -64,31 +90,22 @@ typedef struct MacroFile {
     bool      run;           ///< включён пользователем
     uint32_t  created;       ///< время создания (локальное, TimeLib)
     String    metaCron;      ///< cron-выражение окна из web-таблицы (мета)
+    uint32_t  size;          ///< размер файла на FS (кэш для веб-таблицы)
 
     // --- runtime-состояние (не сохраняется) ---
-    bool      active;        ///< файл запущен и успешно разобран
+    bool      active;        ///< файл зарегистрирован (правила разобраны)
     String    err;           ///< текст последней ошибки (пусто — ошибок нет)
     String    desc;          ///< описание из таблицы сценария
-    EspLuaEngine* lua;       ///< интерпретатор Lua файла (только когда active)
-    LuaMacroCtx  ctx;        ///< контекст команд Lua (ctx.file указывает на этот файл)
-    MacroEntity ents[MACRO_MAX_ENTS];
-    uint8_t   nEnts;         ///< число сущностей в ents
+    bool      needParse;     ///< требуется (пере)регистрация правил
+    uint8_t   parseFails;    ///< счётчик подряд неудачных регистраций (защита от OOM-цикла)
+    MacroRule* rules;        ///< динамический массив правил (heap)
+    uint8_t   nRules;        ///< число правил
 
     // Мета-cron (гейт окна)
     cron_expr metaExpr;
     bool      metaValid;     ///< cron разобран успешно
     bool      metaInit;      ///< next инициализирован
     time_t    metaNext;      ///< следующее срабатывание мета-cron
-
-    // Подписки на события шины
-    uint32_t  subs[MACRO_MAX_SUBS];
-    String    subEvts[MACRO_MAX_SUBS];
-    int       subRefs[MACRO_MAX_SUBS];
-    uint8_t   nSubs;
-
-    // Асинхронный вызов (не более одного на файл)
-    bool      asyncPending;
-    int       asyncCbRef;
 } MacroFile;
 
 /// Структура конфига — сохраняется в config_macros.json

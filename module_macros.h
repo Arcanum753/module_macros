@@ -55,6 +55,7 @@ private:
     void handleFire(AsyncWebServerRequest *request);
     void handleResources(AsyncWebServerRequest *request);
     void handleValidate(AsyncWebServerRequest *request);
+    void handleHeap(AsyncWebServerRequest *request);
     void handleSetCron(AsyncWebServerRequest *request);
     void handleWrite(AsyncWebServerRequest *request);
     void handleGet(AsyncWebServerRequest *request);
@@ -68,6 +69,7 @@ private:
     // Логика работы со списком файлов
     int  findFile(const String& name);       // индекс в _files или -1
     bool nameOk(const String& name);         // проверка имени (без пути)
+    void markAllDirty();                     // пометить все run-файлы на переразбор
     void bumpMeta();                         // отметить изменение списка (пересборка в tick)
     void reconcileList();                    // скан /macros + слияние с метой + сохранение
     void ensureMacrosDir();                  // создать /macros и пример example.lua
@@ -84,28 +86,39 @@ private:
     bool setFilePrio(const String& base, int8_t delta);            // приоритет ± (clamp 0..7)
     bool renameFileEntry(const String& oldBase, const String& newBase);
 
-    // Движок сценариев (вызывается только в main-loop: tick/терминал)
-    bool parseScript(MacroFile& f);          // разобрать файл в таблицу сущностей
-    void destroyScript(MacroFile& f);        // освободить интерпретатор
-    void rebuildScripts();                   // синхронизация _files -> интерпретаторы
-    String runBody(MacroFile& f, int bodyRef);            // выполнить функцию-тело, вернуть ошибку
-    void execBody(MacroFile& f, MacroEntity& e);          // выполнить тело сущности и записать ошибку
-    bool evalCondEntity(MacroFile& f, MacroEntity& e, String& errTxt); // вычислить условие cond
+    // Движок «барабана» (вызывается только в main-loop: tick/терминал)
+    bool initLua();                          // создать единый интерпретатор и команды
+    bool registerFile(MacroFile& f);         // разобрать rules и закрыть файл
+    void unregisterFile(MacroFile& f);       // снять правила и подписки
+    void rebuildScripts();                   // (пере)регистрация только needParse
+    bool anyNeedParse();                     // есть ли файлы, требующие разбора
+    void fireRule(MacroFile& f, MacroRule& r);// исполнить действие правила
+    String runHandler(MacroFile& f, MacroRule& r); // вызвать named-handler (Lua)
+    bool evalCondRule(MacroFile& f, MacroRule& r, String& errTxt); // условие cond
+    void ensureEventSub(const String& name); // подписаться на событие шины
+    void pruneEventSubs();                   // снять неиспользуемые подписки
     void drainEvents();                      // обработка очереди внешних событий
-    void tickStep();                         // шаг исполнения (cron/cond) за одну секунду
+    void tickStep();                         // шаг «барабана» за одну секунду
+    size_t estimateHeapBytes();              // оценка heap, занятого модулем
 
 protected:
     fs::LittleFSFS* _fs;
 
     strMacrosConfig _config;
-    MacroFile _files[MACRO_MAX_FILES];
+    MacroFile* _files;       // массив файлов-сценариев (heap, MACRO_MAX_FILES)
     uint8_t _fileCount;
-    uint8_t _metaRev;        // счётчик изменений меты (для страницы — не используется напрямую)
-    uint8_t _scriptRev;      // счётчик: при изменении tick пересобирает интерпретаторы
-    uint8_t _lastScriptRev;  // последний обработанный tick-ом _scriptRev
     bool _ntpWasSynced;      // для инициализации cron после первой синхронизации NTP
 
-    MacroEvent _evQueue[MACRO_EV_QUEUE];     // очередь внешних событий (term/button)
+    EspLuaEngine* _lua;      // единый Lua-интерпретатор «барабана» (heap)
+    size_t _luaHeapBytes;    // измеренный расход heap на _lua (для валидации)
+
+    struct { String name; uint32_t handle; } _evtSubs[MACRO_MAX_EVENT_SUBS];
+    uint8_t _nEvtSubs;
+
+    String _resourcesJson;    // кэш каталога ресурсов (собирается один раз)
+    bool   _resourcesReady;
+
+    MacroEvent _evQueue[MACRO_EV_QUEUE];     // очередь внешних событий (term/button/on)
     uint8_t _evIn;
     uint8_t _evOut;
 

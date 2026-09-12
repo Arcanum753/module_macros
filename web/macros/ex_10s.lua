@@ -1,12 +1,11 @@
--- Демо: cron каждые 10 секунд, счётчик сохраняется в замыкании.
-local ticks = 0
-
+-- Демо: одна иголочка = один cron. Cron вынесен в мета-конфиг (колонка cron).
+-- Правило без when исполняется по открытию мета-окна.
 return {
-    desc = "every 10s (counter)",
+    desc = "every 10s",
+    handlers = {
+        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
+    },
     rules = {
-        { cron = "*/10 * * * * *", body = function()
-            ticks = ticks + 1
-            puts(clock(), "fired: every 10 seconds, tick", ticks)
-        end },
-    }
+        { run = "tick" },
+    },
 }

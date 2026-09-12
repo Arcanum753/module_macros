@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <title>Macros — help</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        body { width: 900px; }
+        .content h3 { margin: 14px 0 6px; }
+        .content h4 { margin: 10px 0 4px; }
+        .content p, .content li { line-height: 1.5; }
+        code { background: #f0f0f0; padding: 0 3px; }
+        pre { background: #f7f7f7; border: 1px solid #ddd; padding: 6px 8px; overflow: auto; font-size: 12px; }
+        table.help { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px; }
+        table.help th, table.help td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; vertical-align: top; }
+        table.help th { background: #eee; }
+        .ok { color: #1a7f1a; font-weight: bold; }
+        .no { color: #c00000; font-weight: bold; }
+        .warn { color: #b06a00; font-weight: bold; }
+        .note { background: #f3f6ff; border-left: 4px solid #7D8EE2; padding: 6px 10px; margin: 8px 0; }
+    </style>
+</head>
+<body>
+    <markup>./page_head.html</markup>
+    <h2 class="title" style="background: #7D8EE2"> <span id="devicename"></span> Macros — help</h2>
+
+    <div class="content" style="text-align: left; padding: 0 14px;">
+
+        <h3>1. Один «барабан» и много «иголочек»</h3>
+        <p>
+            В модуле <b>один</b> Lua-интерпретатор на всё устройство. При старте файл
+            прочитывается один раз: из него извлекаются <b>правила</b> (cron/cond/term/button/on/body),
+            регистрируются в общем списке, после чего файл закрывается. При срабатывании правило
+            либо выполняет декларативный вызов ресурса, либо перечитывает файл и вызывает нужный
+            <b>named-handler</b>. Поэтому десятки макросов не съедают heap на отдельные интерпретаторы.
+        </p>
+
+        <h3>2. Формат файла (только новый)</h3>
+        <pre>return {
+    desc = "краткое описание для таблицы",
+    handlers = {                       -- необязательно; для run="..."
+        apply = function(ev) set("e7.effect", ev.args[1]) end,
+    },
+    rules = {
+        { cron = "0 20 * * * *", calls = {
+            { name = "e7.effect", args = { 4 } },
+            { name = "e7.speed",  args = { 40 } },
+        } },
+        { cron = "30 22 * * * *", call = "e7.color", args = { 65535 } },
+        { cond = { res = "wifi.connected", op = "==", val = true }, run = "apply", args = { 1 } },
+        { term = "temp 25",   run = "apply", args = { 25 } },
+        { button = "start",   run = "apply" },
+        { on = "wifi.just_connected", run = "apply" },
+        { run = "apply" },              -- тело без when: по открытию мета-окна
+    },
+}</pre>
+
+        <h3>3. Типы правил</h3>
+        <table class="help">
+            <thead><tr><th>when</th><th>Срабатывает</th></tr></thead>
+            <tbody>
+                <tr><td><code>cron</code></td><td>по своему cron-выражению, когда мета-окно открыто</td></tr>
+                <tr><td><code>cond</code></td><td>по фронту <code>false&nbsp;-&gt;&nbsp;true</code> декларативного условия</td></tr>
+                <tr><td><code>term</code></td><td>на команду терминала <code>macro msg &lt;текст&gt;</code> (точное совпадение)</td></tr>
+                <tr><td><code>button</code></td><td>на <code>macro btn &lt;имя&gt;</code> / кнопку веб-страницы</td></tr>
+                <tr><td><code>on</code></td><td>на событие ресурсной шины (подписка оформляется движком)</td></tr>
+                <tr><td>нет when</td><td>тело: по фронту открытия мета-окна; без меты — один раз при старте</td></tr>
+            </tbody>
+        </table>
+
+        <h3>4. Мета-cron — гейт окна</h3>
+        <p>
+            Поле <code>cron</code> в таблице файлов (мета-конфиг) — это <b>гейт</b>, а не исполнитель.
+            Он проверяется каждую секунду: <code>cron_next(expr, now-1) &lt;= now</code>. Пока окно
+            закрыто, правила файла не выполняются. Мета сама тело не запускает.
+        </p>
+        <div class="note">
+            Если в файле <b>единственное</b> cron-выражение, его выносят в мета-cron (поле
+            <code>cron</code> в конфиге), а правило оставляют телом (<code>{ run = "..." }</code>).
+            Для «диапазона» в мете секунды и минуты должны быть <code>*</code>.
+        </div>
+
+        <h3>5. Условия cond (декларативные)</h3>
+        <p>
+            Условие — таблица <code>{res, op, val}</code>, их можно объединить в массив (логическое AND).
+            Поддерживаются операторы:
+        </p>
+        <ul>
+            <li><code>==</code>, <code>!=</code> — равенство/неравенство;</li>
+            <li><code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code> — числовое сравнение;</li>
+            <li><code>changed</code> — сработать при любом изменении значения.</li>
+        </ul>
+        <pre>{ cond = { res = "wifi.rssi", op = "&lt;", val = -70 }, call = "e7.brightness", args = { 10 } }
+{ cond = { {res="wifi.connected", op="==", val=true}, {res="time.valid", op="==", val=true} }, run = "onOk" }</pre>
+
+        <h3>6. Действия правила</h3>
+        <ul>
+            <li><code>call = "ns.func"</code> + <code>args = { ... }</code> — один bus-вызов (без Lua);</li>
+            <li><code>calls = { {name=..., args={...}}, ... }</code> — несколько bus-вызовов подряд;</li>
+            <li><code>run = "имя"</code> + <code>args = { ... }</code> — named-handler из <code>handlers</code>.
+                Файл перечитывается и компилируется в момент срабатывания.</li>
+        </ul>
+        <p>
+            У правила должно быть ровно одно действие. Если функция шины асинхронная, движок вызывает
+            её сам (результат пишется в лог); из Lua асинхронные вызовы недоступны.
+        </p>
+
+        <h3>7. Lua внутри named-handler</h3>
+        <p>Доступны: <code>get</code>, <code>set</code>, <code>call</code>, <code>has</code>,
+            <code>info</code>, <code>mode</code>, <code>puts</code>/<code>print</code>,
+            <code>clock</code>, <code>now</code>.
+            <b>Нет</b> <code>on</code>/<code>off</code>/<code>call_async</code> — события оформляются
+            правилом <code>on</code>, асинхронность — на стороне движка.</p>
+        <p>Handler получает один аргумент — таблицу события:</p>
+        <ul>
+            <li><code>ev.type</code> — <code>"cron"|"cond"|"term"|"button"|"on"|"body"</code>;</li>
+            <li><code>ev.spec</code> — cron/term/button/имя события;</li>
+            <li><code>ev.args</code> — массив аргументов из правила;</li>
+            <li><code>ev.value</code> — значение ресурса (для cond, если есть).</li>
+        </ul>
+
+        <h3>8. Состояние между срабатываниями</h3>
+        <p>
+            Каждый вызов handler получает <b>свежее окружение</b>: глобальные переменные между
+            вызовами не сохраняются. Если нужно помнить значение — храните его в ресурсе
+            <code>core_state</code> (<code>set</code>/<code>get</code>).
+        </p>
+
+        <h3>9. Ошибки</h3>
+        <ul>
+            <li><code>legacy format: use rules with call/run</code> — файл в старом формате.</li>
+            <li><code>cron error: ...</code> — невалидный cron в правиле или в мете.</li>
+            <li><code>File is empty or unreadable</code> — файл пуст/недоступен.</li>
+            <li><code>No memory for interpreter</code> / <code>No memory for rules</code> — не хватило heap; авто-повтор ограничен, затем нажмите <b>Reload</b>.</li>
+            <li><code>call: not found &lt;name&gt;</code> / <code>call ... rc=N</code> — ресурс не найден/ошибка вызова.</li>
+            <li><code>handler not found: &lt;name&gt;</code> — в <code>handlers</code> нет такого имени.</li>
+        </ul>
+
+        <h3>10. Лимиты</h3>
+        <ul>
+            <li>Файлов в списке — до 30.</li>
+            <li>Правил в файле — до 8; bus-вызовов в правиле — до 4; аргументов в вызове — до 4.</li>
+            <li>Инструкций Lua на один вызов handler — <code>MACRO_LUA_MAX_OPS = 100000</code>.</li>
+            <li>Бюджет heap модуля — 100 КБ; при превышении ~95% кнопка «Валидация макросов» показывает критическое состояние.</li>
+        </ul>
+
+        <h3>11. Синтаксис cron</h3>
+        <p>
+            6 полей (секунды минуты часы день месяца месяц день недели), необязательное 7-е — год.
+            Допустимы <code>*</code>, <code>*/N</code>, <code>a-b</code>, <code>a-b/N</code>,
+            <code>a,b,c</code>, <code>?</code>. Генератор — на странице
+            <a href="cron.html" target="_blank" rel="noopener">CRON helper</a>.
+        </p>
+
+    </div>
+
+    <div class="footer">
+        Module version: <span id="macrosversion"> </span> &nbsp;|&nbsp;
+        Build: <span id="macrosgentime"> </span> <br>
+    </div>
+
+    <markup>./page_bottom.html</markup>
+    <script src="GetJson.js" defer></script>
+    <script src="GetMarkup.js" defer></script>
+    <script>
+        setTimeout(function () {
+            try {
+                ApplyCVT('/system/version').then(function () { ApplyCVT('/macros/ver'); }).catch(function () {});
+            } catch (e) {}
+        }, 300);
+    </script>
+</body>
+</html>

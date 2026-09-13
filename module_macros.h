@@ -56,7 +56,6 @@ private:
     void handleResources(AsyncWebServerRequest *request);
     void handleValidate(AsyncWebServerRequest *request);
     void handleHeap(AsyncWebServerRequest *request);
-    void handleSetCron(AsyncWebServerRequest *request);
     void handleWrite(AsyncWebServerRequest *request);
     void handleGet(AsyncWebServerRequest *request);
 
@@ -94,7 +93,7 @@ private:
     bool anyNeedParse();                     // есть ли файлы, требующие разбора
     void fireRule(MacroFile& f, MacroRule& r);// исполнить действие правила
     String runHandler(MacroFile& f, MacroRule& r); // вызвать named-handler (Lua)
-    bool evalCondRule(MacroFile& f, MacroRule& r, String& errTxt); // условие cond
+    bool evalConds(MacroFile& f, MacroRule& r, String& errTxt); // составное условие (AND)
     void ensureEventSub(const String& name); // подписаться на событие шины
     void pruneEventSubs();                   // снять неиспользуемые подписки
     void drainEvents();                      // обработка очереди внешних событий

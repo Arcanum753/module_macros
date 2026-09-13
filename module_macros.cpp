@@ -214,12 +214,6 @@ void CLASS_MODULE_MACROS::web_Init() {
         this->handleHeap(request);
     });
 
-    // AJAX — мета-cron (гейт окна) файла
-    ESPHTTPServer.on("/macros/cron", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
-        this->handleSetCron(request);
-    });
-
     // AJAX — сохранение содержимого сценария (встроенный редактор)
     ESPHTTPServer.on("/macros/save", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
@@ -442,37 +436,6 @@ void CLASS_MODULE_MACROS::handleFire(AsyncWebServerRequest *request) {
     }
 }
 
-void CLASS_MODULE_MACROS::handleSetCron(AsyncWebServerRequest *request) {
-    DEBUGMACROS("%s\r\n", __FUNCTION__);
-
-    if (!request->hasArg("name")) {
-        request->send(200, "text/plain", "ERR: no name");
-        return;
-    }
-    String base = request->arg("name");
-    base.trim();
-    int idx = findFile(MACROS_DIR_RE + base);
-    if (idx < 0) {
-        request->send(200, "text/plain", "ERR: not found");
-        return;
-    }
-
-    String cron = request->hasArg("cron") ? request->arg("cron") : String("");
-    cron.trim();
-    if (cron.length() > 0) {
-        String errTxt;
-        if (ns_module_macros::macroCronValid(cron, errTxt) == false) {
-            request->send(200, "text/plain", String("ERR: cron: ") + errTxt);
-            return;
-        }
-    }
-    _files[idx].metaCron = cron;
-    saveConfig();
-    _files[idx].parseFails = 0;
-    _files[idx].needParse = true;
-    request->send(200, "text/plain", "OK");
-}
-
 void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
@@ -486,12 +449,19 @@ void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
         request->send(200, "text/plain", "ERR: bad name");
         return;
     }
+
+    // Правка и сохранение доступны только для остановленных сценариев.
+    int idx = findFile(MACROS_DIR_RE + base);
+    if (idx >= 0 && _files[idx].run) {
+        request->send(200, "text/plain", "ERR: stop scenario first");
+        return;
+    }
+
     String body = request->arg("body");
     if (writeFile(MACROS_DIR_RE + base, body) == false) {
         request->send(200, "text/plain", "ERR: write failed");
         return;
     }
-    int idx = findFile(MACROS_DIR_RE + base);
     if (idx >= 0) {
         _files[idx].parseFails = 0;
         _files[idx].needParse = true;
@@ -587,8 +557,13 @@ size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
             for (uint8_t j = 0; j < f.nRules; j++) {
                 MacroRule& r = f.rules[j];
                 total += r.spec.length() + 1;
-                total += r.condSpec.length() + 1;
-                total += r.lastVal.length() + 1;
+                total += r.setTarget.length() + 1;
+                if (r.setValue.kind == BusValue::STR) { total += r.setValue.s.length() + 1; }
+                for (uint8_t k = 0; k < r.nConds; k++) {
+                    total += r.conds[k].res.length() + 1;
+                    if (r.conds[k].val.kind == BusValue::STR) { total += r.conds[k].val.s.length() + 1; }
+                    total += r.lastVals[k].length() + 1;
+                }
                 total += r.handler.length() + 1;
                 total += r.handlerArgs.length() + 1;
                 for (uint8_t a = 0; a < r.nActions; a++) {
@@ -659,7 +634,6 @@ bool CLASS_MODULE_MACROS::loadConfig() {
             f.prio     = obj["prio"].as<uint8_t>();
             f.run      = obj["run"].as<bool>();
             f.created  = obj["created"].as<uint32_t>();
-            f.metaCron = obj["cron"].as<String>();
             _fileCount++;
         }
     }
@@ -682,7 +656,6 @@ bool CLASS_MODULE_MACROS::saveConfig() {
         obj["prio"]    = _files[i].prio;
         obj["run"]     = _files[i].run;
         obj["created"] = _files[i].created;
-        obj["cron"]    = _files[i].metaCron;
     }
     return core_json.jsonFileSaveDoc(CONFIG_FILE_MACROS, doc);
 }
@@ -860,7 +833,15 @@ bool CLASS_MODULE_MACROS::createNewFile(const String& base, String& fullPath) {
     fullPath = MACROS_DIR_RE + cand;
 
     String empty;
-    empty = "-- Новый сценарий (Lua). Регистрируйте правила cron/cond/button/term.\r\n";
+    empty  = "-- Новый сценарий (Lua). Каждое правило: when + одно действие set/call/calls/run.\r\n";
+    empty += "-- meta_cron = \"...\" задаёт окно (гейт) для всего файла; без него — активен всегда.\r\n";
+    empty += "return {\r\n";
+    empty += "    desc = \"new scenario\",\r\n";
+    empty += "    -- meta_cron = \"*/10 * * * * *\",\r\n";
+    empty += "    rules = {\r\n";
+    empty += "        -- { when = { cron = \"0 * * * * *\" }, set = \"e7.effect\", value = 1 },\r\n";
+    empty += "    },\r\n";
+    empty += "}\r\n";
     if (writeFile(fullPath, empty) == false) { return false; }
 
     if (addFileEntry(cand, 7, false) == false) {
@@ -975,6 +956,22 @@ void CLASS_MODULE_MACROS::printList() {
                       f.nRules,
                       f.err.length() > 0 ? " err=" : "",
                       f.err.c_str());
+        if (f.rules == NULL) { continue; }
+        for (uint8_t j = 0; j < f.nRules; j++) {
+            MacroRule& r = f.rules[j];
+            String cond = macroRuleCondStr(r);
+            String action;
+            if (r.setTarget.length() > 0) {
+                action = String("set=") + r.setTarget;
+            } else if (r.handler.length() > 0) {
+                action = String("run=") + r.handler;
+            } else {
+                action = String("calls=") + String(r.nActions);
+            }
+            Serial.printf("      #%d %s spec='%s' cond='%s' %s\r\n",
+                          j, macroRuleTypeStr(r.type), r.spec.c_str(),
+                          cond.c_str(), action.c_str());
+        }
     }
 }
 

@@ -366,6 +366,20 @@ static uint8_t macroOpCode(const char* s) {
     return MACRO_COND_EQ;
 }
 
+// Текстовое имя оператора cond (обратное к macroOpCode).
+const char* macroCondOpName(uint8_t op) {
+    switch (op) {
+        case MACRO_COND_EQ:      return "==";
+        case MACRO_COND_NE:      return "!=";
+        case MACRO_COND_LT:      return "<";
+        case MACRO_COND_LE:      return "<=";
+        case MACRO_COND_GT:      return ">";
+        case MACRO_COND_GE:      return ">=";
+        case MACRO_COND_CHANGED: return "changed";
+        default:                 return "?";
+    }
+}
+
 static const char* macroRuleTypeName(uint8_t type) {
     switch (type) {
         case MACRO_RULE_CRON:   return "cron";
@@ -375,6 +389,36 @@ static const char* macroRuleTypeName(uint8_t type) {
         case MACRO_RULE_EVENT:  return "on";
         default:                return "body";
     }
+}
+
+// Внешний доступ к имени типа правила (для printList/логов).
+const char* macroRuleTypeStr(uint8_t type) {
+    return macroRuleTypeName(type);
+}
+
+// Отладочная сериализация cond-условий правила (собирается на месте).
+String macroRuleCondStr(const MacroRule& r) {
+    String out;
+    for (uint8_t i = 0; i < r.nConds; i++) {
+        if (i > 0) { out += ';'; }
+        out += r.conds[i].res;
+        out += '|';
+        out += macroCondOpName(r.conds[i].op);
+        if (r.conds[i].op != MACRO_COND_CHANGED) {
+            out += '|';
+            const BusValue& v = r.conds[i].val;
+            switch (v.kind) {
+                case BusValue::BOOL: out += (v.b ? "true" : "false"); break;
+                case BusValue::I32:  out += String((long)v.i); break;
+                case BusValue::ENUM: out += String((long)v.i); break;
+                case BusValue::F32:  out += String(v.f); break;
+                case BusValue::STR:  out += v.s; break;
+                case BusValue::TIME: out += String((long)v.t); break;
+                default:             out += "-"; break;
+            }
+        }
+    }
+    return out;
 }
 
 // ============================================================
@@ -430,48 +474,54 @@ static bool macroCompare(const BusValue& cur, uint8_t op, const BusValue& want) 
 // Разбор таблицы сценария (новый формат)
 // ============================================================
 
-// Добавляет одно условие из таблицы idx в сериализованную цепочку.
-static void macroCondAdd(lua_State* L, int idx, String& out) {
+// Добавляет одно cond-условие из таблицы idx в структурный массив правила.
+static bool macroCondAddOne(lua_State* L, MacroFile& f, int idx, MacroRule& r) {
+    if (r.nConds >= MACRO_MAX_CONDS) { f.err = String("too many conds (max ") + String((unsigned)MACRO_MAX_CONDS) + ")"; return false; }
     idx = lua_absindex(L, idx);
+
     lua_getfield(L, idx, "res");
     String res = lua_isstring(L, -1) ? String(lua_tostring(L, -1)) : String();
     lua_pop(L, 1);
-    if (res.length() == 0) { return; }
+    if (res.length() == 0) { f.err = "cond: res required"; return false; }
 
     lua_getfield(L, idx, "op");
     String op = lua_isstring(L, -1) ? String(lua_tostring(L, -1)) : String("==");
     lua_pop(L, 1);
+    uint8_t opc = macroOpCode(op.c_str());
 
-    lua_getfield(L, idx, "val");
-    String val = macroValueToStr(L, -1);
-    lua_pop(L, 1);
+    MacroCond& c = r.conds[r.nConds];
+    c.res = res;
+    c.op = opc;
+    c.val = BusValue();
 
-    if (out.length() > 0) { out += ';'; }
-    out += res;
-    out += '|';
-    out += String((unsigned)macroOpCode(op.c_str()));
-    out += '|';
-    out += val;
+    if (opc != MACRO_COND_CHANGED) {
+        lua_getfield(L, idx, "val");
+        if (macroLuaToBusValue(L, lua_gettop(L), c.val) == false) {
+            if (lua_isstring(L, -1)) { c.val = BusValue::str(String(lua_tostring(L, -1))); }
+        }
+        lua_pop(L, 1);
+    }
+    r.nConds++;
+    return true;
 }
 
-// cond = {res=,op=,val=} либо { {..}, {..} } (AND).
-static String macroSerializeCond(lua_State* L, int condIdx) {
-    String out;
+// cond = {res=,op=,val=} либо { {..}, {..} } (AND), до MACRO_MAX_CONDS.
+static bool macroParseConds(lua_State* L, MacroFile& f, int condIdx, MacroRule& r) {
     lua_getfield(L, condIdx, "res");
     bool single = lua_isstring(L, -1);
     lua_pop(L, 1);
 
-    if (single) {
-        macroCondAdd(L, condIdx, out);
-        return out;
-    }
+    if (single) { return macroCondAddOne(L, f, condIdx, r); }
+
     int n = (int)lua_rawlen(L, condIdx);
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, condIdx, i);
-        if (lua_istable(L, -1)) { macroCondAdd(L, lua_absindex(L, -1), out); }
+        bool ok = false;
+        if (lua_istable(L, -1)) { ok = macroCondAddOne(L, f, lua_absindex(L, -1), r); }
         lua_pop(L, 1);
+        if (!ok) { return false; }
     }
-    return out;
+    return true;
 }
 
 // Разбирает одно правило таблицы в MacroRule. Возвращает true при успехе.
@@ -482,71 +532,143 @@ static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
     r.spec = "";
     r.next = 0;
     r.lastCond = false;
-    r.condSpec = "";
-    r.lastVal = "";
-    r.haveLast = false;
+    r.nConds = 0;
+    for (uint8_t i = 0; i < MACRO_MAX_CONDS; i++) {
+        r.conds[i] = MacroCond();
+        r.lastVals[i] = "";
+        r.haveLast[i] = false;
+    }
+    r.setTarget = "";
+    r.setValue = BusValue();
     r.handler = "";
     r.handlerArgs = "";
     r.nActions = 0;
     r.sub = 0;
     memset(&r.expr, 0, sizeof(r.expr));
 
-    // --- when ---
-    lua_getfield(L, tidx, "cron");
-    if (lua_isstring(L, -1)) {
-        r.type = MACRO_RULE_CRON;
-        r.spec = String(lua_tostring(L, -1));
+    // Триггеры допустимы только внутри when = {...} (плоский формат не поддерживается).
+    const char* trigs[] = { "cron", "cond", "term", "button", "on" };
+    for (uint8_t i = 0; i < 5; i++) {
+        lua_getfield(L, tidx, trigs[i]);
+        bool present = lua_isstring(L, -1) || lua_istable(L, -1);
+        lua_pop(L, 1);
+        if (present) {
+            f.err = "triggers must be inside when = {...}";
+            return false;
+        }
+    }
+
+    // --- when: составное условие (AND) ---
+    lua_getfield(L, tidx, "when");
+    if (lua_istable(L, -1)) {
+        int widx = lua_absindex(L, -1);
+
+        // Первичный триггер: максимум один из cron/term/button/on.
+        uint8_t primaries = 0;
+        lua_getfield(L, widx, "cron");
+        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_CRON; r.spec = String(lua_tostring(L, -1)); primaries++; }
+        lua_pop(L, 1);
+        lua_getfield(L, widx, "term");
+        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_TERM; r.spec = String(lua_tostring(L, -1)); primaries++; }
+        lua_pop(L, 1);
+        lua_getfield(L, widx, "button");
+        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_BUTTON; r.spec = String(lua_tostring(L, -1)); primaries++; }
+        lua_pop(L, 1);
+        lua_getfield(L, widx, "on");
+        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_EVENT; r.spec = String(lua_tostring(L, -1)); primaries++; }
+        lua_pop(L, 1);
+
+        if (primaries > 1) {
+            lua_pop(L, 1);
+            f.err = "when: at most one of cron/term/button/on";
+            return false;
+        }
+
+        // Проверочные cond-условия (0..MACRO_MAX_CONDS).
+        lua_getfield(L, widx, "cond");
+        if (lua_istable(L, -1)) {
+            bool ok = macroParseConds(L, f, lua_absindex(L, -1), r);
+            lua_pop(L, 1);
+            if (!ok) { lua_pop(L, 1); return false; }
+        } else {
+            lua_pop(L, 1);
+        }
     }
     lua_pop(L, 1);
 
-    if (r.type == MACRO_RULE_BODY) {
-        lua_getfield(L, tidx, "cond");
-        if (lua_istable(L, -1)) {
-            r.type = MACRO_RULE_COND;
-            r.condSpec = macroSerializeCond(L, lua_absindex(L, -1));
-            if (r.condSpec.length() == 0) { r.type = MACRO_RULE_BODY; }
-        }
-        lua_pop(L, 1);
-    }
-    if (r.type == MACRO_RULE_BODY) {
-        lua_getfield(L, tidx, "term");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_TERM; r.spec = String(lua_tostring(L, -1)); }
-        lua_pop(L, 1);
-    }
-    if (r.type == MACRO_RULE_BODY) {
-        lua_getfield(L, tidx, "button");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_BUTTON; r.spec = String(lua_tostring(L, -1)); }
-        lua_pop(L, 1);
-    }
-    if (r.type == MACRO_RULE_BODY) {
-        lua_getfield(L, tidx, "on");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_EVENT; r.spec = String(lua_tostring(L, -1)); }
-        lua_pop(L, 1);
-    }
+    // Только cond-условия без первичного триггера — правило-наблюдатель (фронт).
+    if (r.type == MACRO_RULE_BODY && r.nConds > 0) { r.type = MACRO_RULE_COND; }
 
-    // Разбор cron-выражения
+    // Разбор cron-выражения первичного триггера.
     if (r.type == MACRO_RULE_CRON) {
         const char* perr = NULL;
         cron_parse_expr(r.spec.c_str(), &r.expr, &perr);
         if (perr) { f.err = String("cron error: ") + perr; return false; }
     }
 
-    // --- действие ---
+    // --- действие: ровно одно из run/call/calls/set ---
+    uint8_t nAct = 0;
+    uint8_t actKind = 0;   // 1=run, 2=call, 3=calls, 4=set
+
     lua_getfield(L, tidx, "run");
-    if (lua_isstring(L, -1)) { r.handler = String(lua_tostring(L, -1)); }
+    if (lua_isstring(L, -1)) { actKind = 1; nAct++; r.handler = String(lua_tostring(L, -1)); }
     lua_pop(L, 1);
 
-    lua_getfield(L, tidx, "args");
-    if (lua_istable(L, -1)) { r.handlerArgs = macroArgsToStr(L, lua_absindex(L, -1)); }
+    lua_getfield(L, tidx, "call");
+    if (lua_isstring(L, -1)) { actKind = 2; nAct++; }
     lua_pop(L, 1);
 
-    if (r.handler.length() > 0) {
+    lua_getfield(L, tidx, "calls");
+    if (lua_istable(L, -1)) { actKind = 3; nAct++; }
+    lua_pop(L, 1);
+
+    lua_getfield(L, tidx, "set");
+    if (lua_isstring(L, -1)) { actKind = 4; nAct++; }
+    lua_pop(L, 1);
+
+    if (nAct == 0) {
+        f.err = String("rule has no action (set/call/calls/run): ") + macroRuleTypeName(r.type);
+        return false;
+    }
+    if (nAct > 1) { f.err = "rule has multiple actions"; return false; }
+
+    if (actKind == 1) {
+        lua_getfield(L, tidx, "args");
+        if (lua_istable(L, -1)) { r.handlerArgs = macroArgsToStr(L, lua_absindex(L, -1)); }
+        lua_pop(L, 1);
         return true;
     }
 
-    // calls = { {name=,args=}, ... } либо { {"name", {args}}, ... }
-    lua_getfield(L, tidx, "calls");
-    if (lua_istable(L, -1)) {
+    if (actKind == 4) {
+        lua_getfield(L, tidx, "set");
+        r.setTarget = String(lua_tostring(L, -1));
+        lua_pop(L, 1);
+
+        lua_getfield(L, tidx, "value");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            f.err = "set: value required";
+            return false;
+        }
+        bool ok = macroLuaToBusValue(L, lua_gettop(L), r.setValue);
+        lua_pop(L, 1);
+        if (!ok) { f.err = "set: bad value"; return false; }
+
+        // Проверка ресурса (best-effort): чистая функция/событие — не значение.
+        if (core_state.has(r.setTarget.c_str())) {
+            BusResInfo info;
+            core_state.info(r.setTarget.c_str(), info);
+            if (info.kind == BusValue::NONE) {
+                f.err = String("set: use call= for function resource ") + r.setTarget;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (actKind == 3) {
+        // calls = { {name=,args=}, ... } либо { {"name", {args}}, ... }
+        lua_getfield(L, tidx, "calls");
         int cidx = lua_absindex(L, -1);
         int n = (int)lua_rawlen(L, cidx);
         if (n > MACRO_MAX_ACTIONS) {
@@ -583,28 +705,22 @@ static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
             }
             lua_pop(L, 1);
         }
-    }
-    lua_pop(L, 1);
-
-    if (r.nActions == 0) {
-        // одиночный call = "ns.func"
-        lua_getfield(L, tidx, "call");
-        if (lua_isstring(L, -1)) {
-            lua_getfield(L, tidx, "args");
-            String args;
-            if (lua_istable(L, -1)) { args = macroArgsToStr(L, lua_absindex(L, -1)); }
-            lua_pop(L, 1);
-            String act = String(lua_tostring(L, -1));
-            if (args.length() > 0) { act += '|'; act += args; }
-            r.actions[r.nActions++] = act;
-        }
         lua_pop(L, 1);
+        if (r.nActions == 0) { f.err = "calls: empty"; return false; }
+        return true;
     }
 
-    if (r.nActions == 0) {
-        f.err = String("rule has no action (call/run): ") + macroRuleTypeName(r.type);
-        return false;
-    }
+    // actKind == 2: одиночный call = "ns.func"
+    lua_getfield(L, tidx, "call");
+    String cname = String(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, tidx, "args");
+    String cargs;
+    if (lua_istable(L, -1)) { cargs = macroArgsToStr(L, lua_absindex(L, -1)); }
+    lua_pop(L, 1);
+    String act = cname;
+    if (cargs.length() > 0) { act += '|'; act += cargs; }
+    r.actions[r.nActions++] = act;
     return true;
 }
 
@@ -694,6 +810,11 @@ bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
     if (lua_isstring(L, -1)) { f.desc = String(lua_tostring(L, -1)); }
     lua_pop(L, 1);
 
+    lua_getfield(L, tbl, "meta_cron");
+    if (lua_isstring(L, -1)) { f.metaCron = String(lua_tostring(L, -1)); }
+    else { f.metaCron = ""; }
+    lua_pop(L, 1);
+
     lua_getfield(L, tbl, "rules");
     if (!lua_istable(L, -1)) {
         f.err = "no rules table";
@@ -754,7 +875,12 @@ bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
     if (f.metaCron.length() > 0) {
         const char* perr = NULL;
         cron_parse_expr(f.metaCron.c_str(), &f.metaExpr, &perr);
-        if (perr) { f.metaValid = false; f.err = "cron error"; }
+        if (perr) {
+            f.metaValid = false;
+            f.err = "cron error";
+            unregisterFile(f);
+            return false;
+        }
     }
 
     // Подписки на события шины
@@ -859,8 +985,38 @@ String CLASS_MODULE_MACROS::runHandler(MacroFile& f, MacroRule& r) {
     return err;
 }
 
-/** Исполняет декларативные bus-вызовы правила. */
+/** Исполняет действие правила: set-запись либо декларативные bus-вызовы. */
 static void macroRunActions(MacroFile& f, MacroRule& r) {
+    if (r.setTarget.length() > 0) {
+        BusResInfo info;
+        int rc = BUS_ERR_NOT_FOUND;
+        if (core_state.info(r.setTarget.c_str(), info) == BUS_OK) {
+            if (info.isFunc && !info.async) {
+                // dual state+func: применяем значение через write-функцию
+                BusValue arg = r.setValue;
+                BusValue res;
+                rc = core_state.call(r.setTarget.c_str(), 1, &arg, res);
+                (void)res;   // результат write-функции не используется
+            } else if (info.kind != BusValue::NONE) {
+                // чистое состояние: коэрсим значение и обновляем реестр
+                BusValue coerced = core_state.valueToKind(r.setValue, info.kind);
+                switch (info.kind) {
+                    case BusValue::BOOL: rc = core_state.setBool(r.setTarget.c_str(), coerced.b); break;
+                    case BusValue::I32:  rc = core_state.setInt(r.setTarget.c_str(), coerced.i); break;
+                    case BusValue::ENUM: rc = core_state.setInt(r.setTarget.c_str(), coerced.i); break;
+                    case BusValue::F32:  rc = core_state.setF32(r.setTarget.c_str(), coerced.f); break;
+                    case BusValue::STR:  rc = core_state.setStr(r.setTarget.c_str(), coerced.s); break;
+                    case BusValue::TIME: rc = core_state.setTime(r.setTarget.c_str(), coerced.t); break;
+                    default: break;
+                }
+            }
+        }
+        if (rc != BUS_OK) {
+            f.err = String("set ") + r.setTarget + " " + ns_core_state::busErrStr(rc);
+        }
+        return;
+    }
+
     for (uint8_t a = 0; a < r.nActions; a++) {
         String act = r.actions[a];
         int sep = act.indexOf('|');
@@ -885,18 +1041,19 @@ static void macroRunActions(MacroFile& f, MacroRule& r) {
             rc = core_state.call_async(name.c_str(), macroNoopCb, nullptr, argc, (argc > 0) ? av : nullptr);
         } else {
             BusValue v = (argc > 0) ? av[0] : BusValue();
+            BusValue coerced = core_state.valueToKind(v, info.kind);
             switch (info.kind) {
-                case BusValue::BOOL: rc = core_state.setBool(name.c_str(), (v.kind == BusValue::BOOL) ? v.b : (v.i != 0)); break;
-                case BusValue::I32:  rc = core_state.setInt(name.c_str(), (int32_t)v.i); break;
-                case BusValue::ENUM: rc = core_state.setInt(name.c_str(), (int32_t)v.i); break;
-                case BusValue::F32:  rc = core_state.setF32(name.c_str(), v.f); break;
-                case BusValue::STR:  rc = core_state.setStr(name.c_str(), v.s); break;
-                case BusValue::TIME: rc = core_state.setTime(name.c_str(), v.t); break;
+                case BusValue::BOOL: rc = core_state.setBool(name.c_str(), coerced.b); break;
+                case BusValue::I32:  rc = core_state.setInt(name.c_str(), coerced.i); break;
+                case BusValue::ENUM: rc = core_state.setInt(name.c_str(), coerced.i); break;
+                case BusValue::F32:  rc = core_state.setF32(name.c_str(), coerced.f); break;
+                case BusValue::STR:  rc = core_state.setStr(name.c_str(), coerced.s); break;
+                case BusValue::TIME: rc = core_state.setTime(name.c_str(), coerced.t); break;
                 default: break;
             }
         }
         if (rc != BUS_OK) {
-            f.err = String("call ") + name + " rc=" + String(rc);
+            f.err = String("call ") + name + " " + ns_core_state::busErrStr(rc);
         }
     }
 }
@@ -913,50 +1070,36 @@ void CLASS_MODULE_MACROS::fireRule(MacroFile& f, MacroRule& r) {
     macroRunActions(f, r);
 }
 
-/** Вычисляет декларативное условие (AND-цепочка). */
-bool CLASS_MODULE_MACROS::evalCondRule(MacroFile& f, MacroRule& r, String& errTxt) {
+/** Вычисляет составное условие правила (AND по структурному массиву conds[]). */
+bool CLASS_MODULE_MACROS::evalConds(MacroFile& f, MacroRule& r, String& errTxt) {
+    (void)f;
     errTxt = "";
     bool all = true;
-    String snapshot;
 
-    int start = 0;
-    while (start <= (int)r.condSpec.length()) {
-        int semi = r.condSpec.indexOf(';', start);
-        String item = (semi < 0) ? r.condSpec.substring(start) : r.condSpec.substring(start, semi);
-        if (item.length() > 0) {
-            int p1 = item.indexOf('|');
-            int p2 = (p1 < 0) ? -1 : item.indexOf('|', p1 + 1);
-            if (p1 < 0 || p2 < 0) { errTxt = "cond parse error"; return false; }
-            String res = item.substring(0, p1);
-            uint8_t op = (uint8_t)item.substring(p1 + 1, p2).toInt();
-            String valStr = item.substring(p2 + 1);
-
-            BusValue cur;
-            if (macroReadRes(res, cur) == false) {
-                errTxt = String("cond: not found ") + res;
-                return false;
-            }
-            String curStr = cur.kind == BusValue::STR ? String("s:") + cur.s
-                           : cur.kind == BusValue::BOOL ? String(cur.b ? "b:1" : "b:0")
-                           : String("i:") + String((long)cur.i);
-            if (snapshot.length() > 0) { snapshot += ';'; }
-            snapshot += curStr;
-
-            if (op == MACRO_COND_CHANGED) {
-                if (r.haveLast && curStr != r.lastVal) { all = all && true; }
-                else { all = false; }
-            } else {
-                BusValue want;
-                macroStrToValue(valStr, want);
-                if (macroCompare(cur, op, want) == false) { all = false; }
-            }
+    for (uint8_t i = 0; i < r.nConds; i++) {
+        MacroCond& c = r.conds[i];
+        BusValue cur;
+        if (macroReadRes(c.res, cur) == false) {
+            // При ошибке чтения lastVals/haveLast НЕ обновляем:
+            // changed должен сработать, когда ресурс снова станет доступен.
+            errTxt = String("cond: not found ") + c.res;
+            return false;
         }
-        if (semi < 0) { break; }
-        start = semi + 1;
-    }
 
-    r.lastVal = snapshot;
-    r.haveLast = true;
+        if (c.op == MACRO_COND_CHANGED) {
+            String curStr = (cur.kind == BusValue::STR) ? String("s:") + cur.s
+                          : (cur.kind == BusValue::BOOL) ? String(cur.b ? "b:1" : "b:0")
+                          : (cur.kind == BusValue::F32) ? String("f:") + String(cur.f)
+                          : (cur.kind == BusValue::TIME) ? String("t:") + String((long)cur.t)
+                          : String("i:") + String((long)cur.i);
+            bool changed = r.haveLast[i] && (curStr != r.lastVals[i]);
+            r.lastVals[i] = curStr;
+            r.haveLast[i] = true;
+            if (!changed) { all = false; }
+        } else {
+            if (macroCompare(cur, c.op, c.val) == false) { all = false; }
+        }
+    }
     return all;
 }
 
@@ -1018,9 +1161,12 @@ static bool macroMetaGate(MacroFile& f, bool ntpSync) {
     if (ntpSync == false) { return false; }
 
     time_t t = (time_t)now();
-    time_t from = (t > 0) ? (t - 1) : 0;
-    time_t n = cron_next(&f.metaExpr, from);
-    return (n != (time_t)-1 && n <= t);
+    if (f.metaInit == false || t >= f.metaNext) {
+        time_t from = (t > 0) ? (t - 1) : 0;
+        f.metaNext = cron_next(&f.metaExpr, from);
+        f.metaInit = true;
+    }
+    return (f.metaNext != (time_t)-1 && f.metaNext <= t);
 }
 
 void CLASS_MODULE_MACROS::drainEvents() {
@@ -1035,7 +1181,14 @@ void CLASS_MODULE_MACROS::drainEvents() {
             if (macroMetaGate(f, ntpSync) == false) { continue; }
             for (uint8_t j = 0; j < f.nRules; j++) {
                 MacroRule& r = f.rules[j];
-                if (r.type == ev.type && r.spec == ev.spec) {
+                if (r.type != ev.type || r.spec != ev.spec) { continue; }
+
+                // Для правил с первичным триггером cond с op=changed сравнивается
+                // с моментом предыдущего срабатывания этого правила.
+                String errTxt;
+                bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
+                if (errTxt.length() > 0) { f.err = errTxt; continue; }
+                if (ok) {
                     DEBUGMACROS("[MACRO] %s %s \"%s\" fired\r\n",
                                 f.name.c_str(), macroRuleTypeName(r.type), ev.spec.c_str());
                     fireRule(f, r);
@@ -1100,24 +1253,32 @@ void CLASS_MODULE_MACROS::tickStep() {
             if (r.type == MACRO_RULE_CRON) {
                 if (ntpSync == false) { continue; }
                 if (r.next == 0) {
+                    // Первичная инициализация: cond не вычисляем, иначе он «застрянет»
+                    // на первом тике и потеряет момент времени.
                     r.next = cron_next(&r.expr, (time_t)now());
                     continue;
                 }
                 if (r.next == (time_t)-1) { continue; }
                 if ((time_t)now() >= r.next) {
-                    DEBUGMACROS("[MACRO] %s cron(%s)\r\n", f.name.c_str(), r.spec.c_str());
-                    fireRule(f, r);
+                    String errTxt;
+                    bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
+                    if (errTxt.length() > 0) { f.err = errTxt; }
+                    if (ok) {
+                        DEBUGMACROS("[MACRO] %s cron(%s)\r\n", f.name.c_str(), r.spec.c_str());
+                        fireRule(f, r);
+                    }
+                    // Продвигаем next всегда — защита от цикла при устойчивой ошибке cond.
                     r.next = cron_next(&r.expr, (time_t)now());
                 }
             }
 
             if (r.type == MACRO_RULE_COND) {
                 String errTxt;
-                bool truth = evalCondRule(f, r, errTxt);
+                bool truth = evalConds(f, r, errTxt);
                 if (errTxt.length() > 0) {
                     f.err = errTxt;
                     DEBUGMACROS("[MACRO] %s cond error: %s\r\n", f.name.c_str(), errTxt.c_str());
-                    continue;
+                    continue;   // fire не вызывается, lastCond не меняем
                 }
                 if (truth && r.lastCond == false) {
                     DEBUGMACROS("[MACRO] %s cond(true)\r\n", f.name.c_str());

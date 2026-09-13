@@ -1,20 +1,12 @@
--- Демо: ресурсная шина core_state.
--- cron-правило вызывает named-handler; cond — декларативное (ресурс+оператор+значение).
+-- Демонстрация: подписка на событие шины + cond с числовым оператором.
 return {
-    desc = "bus API demo (wifi/time)",
-    handlers = {
-        show = function(ev)
-            if get("wifi.connected") then
-                puts("ip:", get("wifi.ip"), "rssi:", get("wifi.rssi"))
-            end
-            puts("time valid:", get("time.valid"))
-        end,
-        onconn = function(ev)
-            puts("wifi connected, ip", get("wifi.ip"))
-        end,
-    },
+    desc = "on wifi.just_connected + cond rssi",
     rules = {
-        { cron = "*/5 * * * * *", run = "show" },
-        { cond = { res = "wifi.connected", op = "==", val = true }, run = "onconn" },
+        { when = { on = "wifi.just_connected" },
+          call = "e7.speed", args = { 40 } },
+        { when = { cond = { res = "wifi.rssi", op = "<", val = -70 } },
+          set = "e7.brightness", value = 10 },
+        { when = { cond = { res = "wifi.rssi", op = "changed" } },
+          call = "e7.speed", args = { 20 } },
     },
 }

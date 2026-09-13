@@ -17,7 +17,6 @@
         #macTable th, #macTable td { border-bottom: 1px solid #e0e0e0; padding: 2px 4px; text-align: left; }
         #macTable tr.chk-sel { background: #fff7d6; }
         #macTable tr.sel { background: #dce7ff; }
-        #macTable input.cron { width: 110px; font-size: 11px; }
         #macTable button.mini { font-size: 11px; line-height: 1; padding: 1px 3px; cursor: pointer; }
         #macTable button.mini.active { background: #7D8EE2; color: #fff; border-color: #5a6cc0; }
         .iconbar { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
@@ -35,6 +34,8 @@
         }
         .editor-wrap pre { position: absolute; inset: 0; color: #222; pointer-events: none; }
         .editor-wrap textarea { position: relative; background: transparent; color: transparent; caret-color: #000; resize: none; }
+        .editor-wrap.locked { background: #f0f0f0; }
+        .editor-wrap.locked pre { opacity: .5; }
         .kw { color: #0000cc; font-weight: bold; }
         .str { color: #a31515; }
         .cmt { color: #008000; }
@@ -93,10 +94,11 @@
             <div class="iconbar">
                 <span id="editName" style="font-size:12px;color:#555;">(no file)</span>
                 <button onclick="validateBody()">Validate</button>
-                <button onclick="saveBody()">Save</button>
+                <button id="btnSave" onclick="saveBody()">Save</button>
+                <button id="btnOpenAce" style="display:none;" onclick="openInEditor()">Open in editor</button>
                 <span id="editStatus" style="font-size:12px;color:#555;"></span>
             </div>
-            <div class="editor-wrap">
+            <div class="editor-wrap" id="editorWrap">
                 <pre id="hl"></pre>
                 <textarea id="lua" spellcheck="true" oninput="onEdit()" onscroll="syncScroll()"></textarea>
             </div>
@@ -114,6 +116,8 @@
     <script>
         let SEL = new Set();
         let CUR_EDIT = null;
+        let CUR_EDIT_RUN = false;
+        let RUNMAP = {};
         let EDITOR_AVAILABLE = false;
         let CUR_TREE = {};
 
@@ -127,54 +131,73 @@
         }
 
         async function refresh() {
-            const txt = await fetch('/macros/list', { cache: 'no-store' }).then(r => r.json());
-            const body = document.getElementById('macBody');
-            body.innerHTML = '';
-            const files = txt.files || [];
-            for (const f of files) {
-                const tr = document.createElement('tr');
-                tr.dataset.name = f.name;
-                const chk = document.createElement('input'); chk.type = 'checkbox';
-                chk.onclick = (e) => { e.stopPropagation(); toggleSel(f.name, chk.checked); };
-                const td0 = document.createElement('td'); td0.appendChild(chk);
-                tr.appendChild(td0);
-                tr.insertAdjacentHTML('beforeend', '<td>' + f.prio + '</td>');
+            document.getElementById('busy').innerText = '...';
+            try {
+                const txt = await fetch('/macros/list', { cache: 'no-store' }).then(r => r.json());
+                const body = document.getElementById('macBody');
+                body.innerHTML = '';
+                const files = txt.files || [];
+                RUNMAP = {};
+                for (const f of files) {
+                    RUNMAP[f.name] = !!f.run;
+                    const tr = document.createElement('tr');
+                    tr.dataset.name = f.name;
+                    const chk = document.createElement('input'); chk.type = 'checkbox';
+                    chk.onclick = (e) => { e.stopPropagation(); toggleSel(f.name, chk.checked); };
+                    const td0 = document.createElement('td'); td0.appendChild(chk);
+                    tr.appendChild(td0);
+                    tr.insertAdjacentHTML('beforeend', '<td>' + f.prio + '</td>');
 
-                // Колонка start/stop: две кнопки, активная подсвечена
-                const tdRun = document.createElement('td');
-                const bStart = document.createElement('button');
-                bStart.textContent = '\u25B6'; bStart.title = 'start';
-                bStart.className = 'mini' + (f.run ? ' active' : '');
-                bStart.onclick = (e) => { e.stopPropagation(); setRun(f.name, 1); };
-                const bStop = document.createElement('button');
-                bStop.textContent = '\u25A0'; bStop.title = 'stop';
-                bStop.className = 'mini' + (f.run ? '' : ' active');
-                bStop.onclick = (e) => { e.stopPropagation(); setRun(f.name, 0); };
-                tdRun.appendChild(bStart); tdRun.appendChild(bStop);
-                tr.appendChild(tdRun);
+                    // Колонка start/stop: две кнопки, активная подсвечена
+                    const tdRun = document.createElement('td');
+                    const bStart = document.createElement('button');
+                    bStart.textContent = '\u25B6'; bStart.title = 'start';
+                    bStart.className = 'mini' + (f.run ? ' active' : '');
+                    bStart.onclick = (e) => { e.stopPropagation(); setRun(f.name, 1); };
+                    const bStop = document.createElement('button');
+                    bStop.textContent = '\u25A0'; bStop.title = 'stop';
+                    bStop.className = 'mini' + (f.run ? '' : ' active');
+                    bStop.onclick = (e) => { e.stopPropagation(); setRun(f.name, 0); };
+                    tdRun.appendChild(bStart); tdRun.appendChild(bStop);
+                    tr.appendChild(tdRun);
 
-                tr.insertAdjacentHTML('beforeend', '<td>' + esc(f.name) + '</td>');
-                const tdCron = document.createElement('td');
-                const inp = document.createElement('input'); inp.className = 'cron'; inp.value = f.cron || '';
-                inp.onclick = (e) => e.stopPropagation();
-                inp.onchange = () => saveCron(f.name, inp.value);
-                tdCron.appendChild(inp); tr.appendChild(tdCron);
-                tr.insertAdjacentHTML('beforeend',
-                    '<td>' + esc(f.desc || '') + '</td>' +
-                    '<td>' + (f.run ? 'on' : 'off') + '</td>' +
-                    '<td title="' + esc(f.err) + '">' + (f.err ? '!' : '') + '</td>' +
-                    '<td>' + fmtDate(f.created) + '</td>');
-                if (f.name === CUR_EDIT) { tr.classList.add('sel'); }
-                tr.onclick = () => selectRow(tr, f.name);
-                tr.ondblclick = () => actEdit();
-                body.appendChild(tr);
+                    tr.insertAdjacentHTML('beforeend', '<td>' + esc(f.name) + '</td>');
+                    const tdCron = document.createElement('td');
+                    tdCron.textContent = f.cron || '';
+                    tdCron.title = f.cron ? ('meta_cron: ' + f.cron) : '(нет meta_cron — активен всегда)';
+                    tr.appendChild(tdCron);
+                    tr.insertAdjacentHTML('beforeend',
+                        '<td>' + esc(f.desc || '') + '</td>' +
+                        '<td>' + (f.run ? 'on' : 'off') + '</td>' +
+                        '<td title="' + esc(f.err) + '">' + (f.err ? '!' : '') + '</td>' +
+                        '<td>' + fmtDate(f.created) + '</td>');
+                    if (f.name === CUR_EDIT) { tr.classList.add('sel'); }
+                    tr.onclick = () => selectRow(tr, f.name);
+                    tr.ondblclick = () => actEdit();
+                    body.appendChild(tr);
+                }
+                CUR_EDIT_RUN = !!RUNMAP[CUR_EDIT];
+                syncSelUi();
+                updateEditorLock();
+            } finally {
+                document.getElementById('busy').innerText = '';
             }
-            syncSelUi();
+        }
+
+        // Агрегация ответов нескольких endpoint-вызовов: все "OK" → "OK", иначе первый "ERR...".
+        function aggStatus(results) {
+            let err = "";
+            for (const r of (results || [])) {
+                const t = (r || "").trim();
+                if (t !== "OK") { if (!err) { err = t; } }
+            }
+            return err || "OK";
         }
 
         async function setRun(name, on) {
-            await api('/macros/state?name=' + encodeURIComponent(name) + '&on=' + on);
-            refresh();
+            const r = await api('/macros/state?name=' + encodeURIComponent(name) + '&on=' + on);
+            document.getElementById('status').innerText = r;
+            await refresh();
         }
 
         // Валидация бюджета heap модуля: сервер оценивает занятую память
@@ -210,6 +233,7 @@
             document.querySelectorAll('#macBody tr').forEach(r => r.classList.remove('sel'));
             tr.classList.add('sel');
             CUR_EDIT = name;
+            CUR_EDIT_RUN = !!RUNMAP[name];
             openFile(name);
         }
         function syncSelUi() {
@@ -224,6 +248,7 @@
             });
             const hdr = document.getElementById('chkAll');
             if (hdr) { hdr.checked = all; hdr.indeterminate = (!all && !none); }
+            updateEditorLock();
         }
         function toggleAll(on) {
             SEL.clear();
@@ -245,28 +270,39 @@
         async function actRun() { await runState(1); }
         async function actStop() { await runState(0); }
         async function runState(on) {
-            for (const n of SEL) { await api('/macros/state?name=' + encodeURIComponent(n) + '&on=' + on); }
+            const results = [];
+            for (const n of SEL) {
+                results.push(await api('/macros/state?name=' + encodeURIComponent(n) + '&on=' + on));
+            }
+            document.getElementById('status').innerText = aggStatus(results);
             refresh();
         }
         async function actReload() {
             const n = firstSelected();
-            await api('/macros/reload' + (n ? '?name=' + encodeURIComponent(n) : ''));
+            const r = await api('/macros/reload' + (n ? '?name=' + encodeURIComponent(n) : ''));
+            document.getElementById('status').innerText = r;
             refresh();
         }
         async function actPrio(dir) {
-            for (const n of SEL) { await api('/macros/prio?name=' + encodeURIComponent(n) + '&dir=' + dir); }
+            const results = [];
+            for (const n of SEL) {
+                results.push(await api('/macros/prio?name=' + encodeURIComponent(n) + '&dir=' + dir));
+            }
+            document.getElementById('status').innerText = aggStatus(results);
             refresh();
         }
         async function actDel() {
             if (!SEL.size || !confirm('Delete selected?')) { return; }
-            await api('/macros/delete?name=' + encodeURIComponent([...SEL].join(',')));
+            const r = await api('/macros/delete?name=' + encodeURIComponent([...SEL].join(',')));
+            document.getElementById('status').innerText = r;
             SEL.clear(); refresh();
         }
         async function actRename() {
             const n = firstSelected(); if (!n) { return; }
             const nn = prompt('New name', n);
             if (!nn || nn === n) { return; }
-            await api('/macros/rename?old=' + encodeURIComponent(n) + '&new=' + encodeURIComponent(nn));
+            const r = await api('/macros/rename?old=' + encodeURIComponent(n) + '&new=' + encodeURIComponent(nn));
+            document.getElementById('status').innerText = r;
             refresh();
         }
         function actEdit() {
@@ -278,15 +314,40 @@
             const body = await (await fetch('/macros/get?name=' + encodeURIComponent(name), { cache: 'no-store' })).text();
             document.getElementById('lua').value = body;
             onEdit();
+            updateEditorLock();
         }
-        async function saveCron(name, cron) {
-            const r = await api('/macros/cron?name=' + encodeURIComponent(name) + '&cron=' + encodeURIComponent(cron));
-            document.getElementById('status').innerText = r;
+
+        // Запущенные сценарии — только просмотр: правка/Save доступны после Stop.
+        function updateEditorLock() {
+            const ta = document.getElementById('lua');
+            const wrap = document.getElementById('editorWrap');
+            const btn = document.getElementById('btnSave');
+            if (!ta || !btn) { return; }
+            ta.readOnly = CUR_EDIT_RUN;
+            if (wrap) { wrap.classList.toggle('locked', CUR_EDIT_RUN); }
+            btn.disabled = CUR_EDIT_RUN;
+            btn.title = CUR_EDIT_RUN ? 'Остановите сценарий для сохранения' : '';
+        }
+
+        function openInEditor() {
+            if (!CUR_EDIT) {
+                document.getElementById('status').innerText = 'ERR: no file selected';
+                return;
+            }
+            window.open('edit.html?file=' + encodeURIComponent('/macros/' + CUR_EDIT), '_blank');
         }
         async function saveBody() {
-            const n = firstSelected(); if (!n) { return; }
+            // Сохраняем всегда в файл, открытый в редакторе (CUR_EDIT),
+            // а не в случайно выбранный чекбоксом.
+            const n = CUR_EDIT;
+            if (!n) { document.getElementById('editStatus').innerText = 'ERR: no file'; return; }
+            if (RUNMAP[n]) {
+                document.getElementById('editStatus').innerText = 'ERR: stop scenario first';
+                return;
+            }
             const r = await api('/macros/save?name=' + encodeURIComponent(n) + '&body=' + encodeURIComponent(document.getElementById('lua').value));
             document.getElementById('editStatus').innerText = r;
+            if (r.trim() !== 'OK') { alert(r); }
             refresh();
         }
         async function validateBody() {
@@ -320,6 +381,8 @@
             const feat = data.features || {};
             EDITOR_AVAILABLE = (feat.editor === 1);
             document.getElementById('btnEdit').style.display = EDITOR_AVAILABLE ? '' : 'none';
+            const btnAce = document.getElementById('btnOpenAce');
+            if (btnAce) { btnAce.style.display = EDITOR_AVAILABLE ? '' : 'none'; }
             const tree = document.getElementById('resTree');
             tree.innerHTML = '';
             const groups = {};
@@ -346,12 +409,13 @@
         }
         function showProps(r) {
             let h = '<b>' + esc(r.full) + '</b><br>' + esc(r.desc || '');
-            h += '<br>kind: ' + r.kind + ' | ro: ' + !r.rw + ' | async: ' + !!r.a + ' | event: ' + !!r.e;
+            h += '<br>kind: ' + r.kind + ' | ro: ' + !r.rw + ' | func: ' + !!r.f + ' | async: ' + !!r.a + ' | event: ' + !!r.e;
             if (r.enum) { h += '<br>enum: ' + r.enum.join(', '); }
             if (r.codes) { r.codes.forEach(c => { h += '<br>code ' + c.code + ': ' + esc(c.meaning); }); }
             document.getElementById('propPanel').innerHTML = h;
         }
         function insertSnippet(r) {
+            if (CUR_EDIT_RUN) { return; }   // запущенный сценарий — только просмотр
             const ta = document.getElementById('lua');
             let s;
             if (r.f) { s = (r.a ? '-- async: вызывается движком, без callback\n' : '') + 'call("' + r.full + '")'; }

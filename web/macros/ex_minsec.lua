@@ -1,10 +1,12 @@
--- Демо: одна иголочка = один cron (в мета-конфиге).
+-- Демонстрация: составной триггер — cron И условие ресурса.
+-- Сработает в :42:15 каждого часа, только если Wi-Fi подключён.
 return {
-    desc = "at 42:15 every hour",
-    handlers = {
-        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
-    },
+    desc = "at 42:15 hourly, if wifi.connected",
     rules = {
-        { run = "tick" },
+        { when = {
+              cron = "15 42 * * * *",
+              cond = { res = "wifi.connected", op = "==", val = true },
+          },
+          call = "e7.speed", args = { 25 } },
     },
 }

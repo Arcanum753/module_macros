@@ -29,88 +29,155 @@
         <h3>1. Один «барабан» и много «иголочек»</h3>
         <p>
             В модуле <b>один</b> Lua-интерпретатор на всё устройство. При старте файл
-            прочитывается один раз: из него извлекаются <b>правила</b> (cron/cond/term/button/on/body),
-            регистрируются в общем списке, после чего файл закрывается. При срабатывании правило
-            либо выполняет декларативный вызов ресурса, либо перечитывает файл и вызывает нужный
-            <b>named-handler</b>. Поэтому десятки макросов не съедают heap на отдельные интерпретаторы.
+            прочитывается один раз: из него извлекаются <b>правила</b>, регистрируются в общем
+            списке, после чего файл закрывается. При срабатывании правило либо выполняет
+            декларативный bus-вызов (<code>set</code>/<code>call</code>/<code>calls</code>), либо
+            перечитывает файл и вызывает нужный <b>named-handler</b> (<code>run</code>). Поэтому
+            десятки макросов не съедают heap на отдельные интерпретаторы.
         </p>
 
-        <h3>2. Формат файла (только новый)</h3>
+        <h3>2. Формат файла</h3>
+        <p>Файл возвращает таблицу с полем <code>rules</code> (массив). Каждое правило —
+        составное условие <code>when</code> плюс ровно одно действие.</p>
         <pre>return {
     desc = "краткое описание для таблицы",
-    handlers = {                       -- необязательно; для run="..."
+    handlers = {                       -- необязательно; только для run="..."
         apply = function(ev) set("e7.effect", ev.args[1]) end,
     },
     rules = {
-        { cron = "0 20 * * * *", calls = {
-            { name = "e7.effect", args = { 4 } },
-            { name = "e7.speed",  args = { 40 } },
+        { when = { cron = "0 * * * * *", cond = { res = "wifi.connected", op = "==", val = true } },
+          call = "e7.speed", args = { 50 } },
+        { when = { term = "temp 25" },   set = "e7.effect", value = 1 },
+        { when = { button = "start" },   call = "e7.speed", args = { 50 } },
+        { calls = {                     -- правило без when: тело по открытию мета-окна
+            { name = "e7.effect", args = { 2 } },
+            { name = "e7.speed",  args = { 30 } },
         } },
-        { cron = "30 22 * * * *", call = "e7.color", args = { 65535 } },
-        { cond = { res = "wifi.connected", op = "==", val = true }, run = "apply", args = { 1 } },
-        { term = "temp 25",   run = "apply", args = { 25 } },
-        { button = "start",   run = "apply" },
-        { on = "wifi.just_connected", run = "apply" },
-        { run = "apply" },              -- тело без when: по открытию мета-окна
     },
 }</pre>
 
-        <h3>3. Типы правил</h3>
+        <h3>3. Составной триггер `when`</h3>
+        <p>
+            Все поля <code>when</code> объединяются по <b>AND</b>: правило срабатывает, когда
+            истинны все условия одновременно.
+        </p>
+        <p>Допустимые «первичные» триггеры внутри <code>when</code> (максимум <b>один</b> на правило):</p>
+        <ul>
+            <li><code>cron</code> — «наступил момент времени, совпадающий с выражением» (проверяется на тике);</li>
+            <li><code>term</code> — пришёл term-токен с этим спецификатором (<code>macro msg</code>);</li>
+            <li><code>button</code> — пришла button-команда (<code>macro btn</code> / кнопка веб-страницы);</li>
+            <li><code>on</code> — пришло событие ресурсной шины с этим именем (подписку оформляет движок).</li>
+        </ul>
+        <p><code>cond</code> — не триггер, а проверка; их может быть до <b>4</b> (одна таблица или массив),
+        все складываются в AND вместе с первичным триггером и/или самостоятельно.</p>
+        <p>Если первичных триггеров больше одного — ошибка разбора
+        <code>when: at most one of cron/term/button/on</code>. Триггер-поля на верхнем уровне
+        правила (вне <code>when</code>) — ошибка <code>triggers must be inside when = {...}</code>.</p>
+        <p>Три сценария правила:</p>
         <table class="help">
             <thead><tr><th>when</th><th>Срабатывает</th></tr></thead>
             <tbody>
-                <tr><td><code>cron</code></td><td>по своему cron-выражению, когда мета-окно открыто</td></tr>
-                <tr><td><code>cond</code></td><td>по фронту <code>false&nbsp;-&gt;&nbsp;true</code> декларативного условия</td></tr>
-                <tr><td><code>term</code></td><td>на команду терминала <code>macro msg &lt;текст&gt;</code> (точное совпадение)</td></tr>
-                <tr><td><code>button</code></td><td>на <code>macro btn &lt;имя&gt;</code> / кнопку веб-страницы</td></tr>
-                <tr><td><code>on</code></td><td>на событие ресурсной шины (подписка оформляется движком)</td></tr>
-                <tr><td>нет when</td><td>тело: по фронту открытия мета-окна; без меты — один раз при старте</td></tr>
+                <tr><td>один триггер + 0..4 cond</td><td>по триггеру И при всех истинных cond</td></tr>
+                <tr><td>только cond (без триггера)</td><td>по фронту <code>false&nbsp;-&gt;&nbsp;true</code> (один раз на переход)</td></tr>
+                <tr><td>нет when (или пустой)</td><td><b>body</b>: один раз при открытии мета-окна; без меты — один раз при старте</td></tr>
             </tbody>
         </table>
 
-        <h3>4. Мета-cron — гейт окна</h3>
-        <p>
-            Поле <code>cron</code> в таблице файлов (мета-конфиг) — это <b>гейт</b>, а не исполнитель.
-            Он проверяется каждую секунду: <code>cron_next(expr, now-1) &lt;= now</code>. Пока окно
-            закрыто, правила файла не выполняются. Мета сама тело не запускает.
-        </p>
-        <div class="note">
-            Если в файле <b>единственное</b> cron-выражение, его выносят в мета-cron (поле
-            <code>cron</code> в конфиге), а правило оставляют телом (<code>{ run = "..." }</code>).
-            Для «диапазона» в мете секунды и минуты должны быть <code>*</code>.
-        </div>
+        <h3>4. Действия правила</h3>
+        <p>У правила должно быть <b>ровно одно</b> действие:</p>
+        <ul>
+            <li><code>set = "ns.field"</code> + <code>value = N</code> — запись в ресурс состояния
+                (для ресурса с write-функцией — вызов функции, см. §7);</li>
+            <li><code>call = "ns.func"</code> + <code>args = { ... }</code> — один bus-вызов;</li>
+            <li><code>calls = { {name=, args=}, ... }</code> — несколько bus-вызовов (до 4);</li>
+            <li><code>run = "имя"</code> + <code>args = { ... }</code> — named-handler из
+                <code>handlers</code> (<b>тяжёлый путь</b>, см. §5).</li>
+        </ul>
+        <p>Больше одного действия — ошибка <code>rule has multiple actions</code>. Если функция шины
+        асинхронная, движок вызывает её сам (результат пишется в лог); из Lua асинхронные вызовы
+        недоступны.</p>
 
-        <h3>5. Условия cond (декларативные)</h3>
+        <h3>5. Когда использовать `run`</h3>
         <p>
-            Условие — таблица <code>{res, op, val}</code>, их можно объединить в массив (логическое AND).
+            <code>run</code> перечитывает и компилирует файл при <b>каждом</b> срабатывании — это
+            тяжёлый путь. Используйте его только для редкой логики (реже раза в минуту), когда
+            действительно нужны ветвления, циклы или замыкания. Для массовых макросов —
+            <code>set</code>/<code>call</code>/<code>calls</code>.
+        </p>
+
+        <h3>6. Условия cond</h3>
+        <p>
+            Условие — таблица <code>{res, op, val}</code>, их можно объединить в массив (AND).
             Поддерживаются операторы:
         </p>
         <ul>
             <li><code>==</code>, <code>!=</code> — равенство/неравенство;</li>
             <li><code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code> — числовое сравнение;</li>
-            <li><code>changed</code> — сработать при любом изменении значения.</li>
+            <li><code>changed</code> — сработать при любом изменении значения (см. §8).</li>
         </ul>
-        <pre>{ cond = { res = "wifi.rssi", op = "&lt;", val = -70 }, call = "e7.brightness", args = { 10 } }
-{ cond = { {res="wifi.connected", op="==", val=true}, {res="time.valid", op="==", val=true} }, run = "onOk" }</pre>
+        <pre>{ when = { cond = { res = "wifi.rssi", op = "&lt;", val = -70 } }, set = "e7.brightness", value = 10 }
+{ when = { cron = "0 * * * * *", cond = {
+      {res="wifi.connected", op="==", val=true},
+      {res="time.valid",     op="==", val=true} } }, run = "onOk" }</pre>
 
-        <h3>6. Действия правила</h3>
-        <ul>
-            <li><code>call = "ns.func"</code> + <code>args = { ... }</code> — один bus-вызов (без Lua);</li>
-            <li><code>calls = { {name=..., args={...}}, ... }</code> — несколько bus-вызовов подряд;</li>
-            <li><code>run = "имя"</code> + <code>args = { ... }</code> — named-handler из <code>handlers</code>.
-                Файл перечитывается и компилируется в момент срабатывания.</li>
-        </ul>
+        <h3>7. `set` на ресурсах с write-функцией</h3>
         <p>
-            У правила должно быть ровно одно действие. Если функция шины асинхронная, движок вызывает
-            её сам (результат пишется в лог); из Lua асинхронные вызовы недоступны.
+            Если у ресурса зарегистрирована write-функция (dual state+func, как <code>e7.effect</code>),
+            <code>set = "ns.field", value = N</code> <b>вызывает функцию</b> с указанным значением —
+            эффект применяется к железу, а значение ресурса обновляется внутри модуля. Для чистых
+            state-ресурсов (без функции) <code>set</code> обновляет значение в реестре — модуль сам
+            прочитает его в своём <code>loop()</code>.
+        </p>
+        <p>
+            Проверить наличие write-функции — двойной клик в дереве ресурсов (<code>func: true</code> в
+            свойствах) или <code>info("ns.field")</code> в Lua.
+        </p>
+        <div class="note">
+            <i>Требует уточнения в будущем:</i> если появится модуль, реагирующий на state
+            <b>только</b> через внешнюю write-функцию без чтения в <code>loop()</code>, семантика
+            <code>set</code> может быть пересмотрена (предпочтение <code>call</code>).
+        </div>
+
+        <h3>8. `cond` с `op = "changed"` в правилах `on`/`term`/`button`</h3>
+        <p>
+            Для правила с первичным триггером (<code>on</code>/<code>term</code>/<code>button</code>)
+            <code>changed</code> сравнивает значение с моментом <b>предыдущего срабатывания этого же
+            правила</b>, а не с предыдущим тиком. То есть для
+            <code>when = { on = "X", cond = { res = "Y", op = "changed" } }</code>: сработать на событие X,
+            если Y изменилось с прошлого X.
+        </p>
+        <p>
+            Для правил без первичного триггера (<code>when = { cond = changed }</code>) <code>changed</code>
+            сравнивается с предыдущим тиком.
         </p>
 
-        <h3>7. Lua внутри named-handler</h3>
+        <h3>9. Мета-cron — гейт окна</h3>
+        <p>
+            Поле <code>meta_cron</code> в возвращаемой таблице задаёт окно, в котором сценарий
+            активен: <code>meta_cron = "*/10 * * * * *"</code> — каждые 10 секунд. Если поля
+            нет — сценарий активен всегда. Мета-cron сам тело не запускает, он лишь
+            «открывает окно» для правил файла. Невалидный <code>meta_cron</code> →
+            <code>err = "cron error"</code>, сценарий не запускается.
+        </p>
+        <div class="note">
+            Если в файле <b>единственное</b> cron-выражение, его выносят в
+            <code>meta_cron</code> (поле файла), а правило оставляют телом
+            (<code>{ set = ... }</code> или <code>{ call = ... }</code>). Для «диапазона» в
+            мете секунды и минуты должны быть <code>*</code>.
+        </div>
+        <p>
+            Мета-cron — часть файла <code>.lua</code> и сохраняется вместе с ним. Колонка
+            <code>cron</code> в таблице показывает значение из активного сценария (read-only);
+            после остановки файла колонка пуста, потому что скрипт не распарсен.
+        </p>
+
+        <h3>10. Lua внутри named-handler</h3>
         <p>Доступны: <code>get</code>, <code>set</code>, <code>call</code>, <code>has</code>,
             <code>info</code>, <code>mode</code>, <code>puts</code>/<code>print</code>,
             <code>clock</code>, <code>now</code>.
             <b>Нет</b> <code>on</code>/<code>off</code>/<code>call_async</code> — события оформляются
-            правилом <code>on</code>, асинхронность — на стороне движка.</p>
+            правилом <code>on</code>, асинхронность — на стороне движка. Всё это доступно только
+            внутри <code>run=</code>-пути.</p>
         <p>Handler получает один аргумент — таблицу события:</p>
         <ul>
             <li><code>ev.type</code> — <code>"cron"|"cond"|"term"|"button"|"on"|"body"</code>;</li>
@@ -118,33 +185,38 @@
             <li><code>ev.args</code> — массив аргументов из правила;</li>
             <li><code>ev.value</code> — значение ресурса (для cond, если есть).</li>
         </ul>
-
-        <h3>8. Состояние между срабатываниями</h3>
         <p>
             Каждый вызов handler получает <b>свежее окружение</b>: глобальные переменные между
             вызовами не сохраняются. Если нужно помнить значение — храните его в ресурсе
-            <code>core_state</code> (<code>set</code>/<code>get</code>).
+            <code>core_state</code>.
         </p>
 
-        <h3>9. Ошибки</h3>
+        <h3>11. Ошибки</h3>
         <ul>
-            <li><code>legacy format: use rules with call/run</code> — файл в старом формате.</li>
+            <li><code>triggers must be inside when = {...}</code> — триггер-поле задано вне <code>when</code>.</li>
+            <li><code>when: at most one of cron/term/button/on</code> — в <code>when</code> больше одного первичного триггера.</li>
+            <li><code>rule has multiple actions</code> — задано больше одного действия.</li>
+            <li><code>rule has no action (set/call/calls/run)</code> — действие не задано.</li>
+            <li><code>set: use call= for function resource &lt;name&gt;</code> — ресурс — чистая функция.</li>
+            <li><code>set: value required</code> — у <code>set</code> нет значения.</li>
             <li><code>cron error: ...</code> — невалидный cron в правиле или в мете.</li>
             <li><code>File is empty or unreadable</code> — файл пуст/недоступен.</li>
             <li><code>No memory for interpreter</code> / <code>No memory for rules</code> — не хватило heap; авто-повтор ограничен, затем нажмите <b>Reload</b>.</li>
-            <li><code>call: not found &lt;name&gt;</code> / <code>call ... rc=N</code> — ресурс не найден/ошибка вызова.</li>
+            <li><code>call: not found &lt;name&gt;</code> / <code>call &lt;name&gt; &lt;текст ошибки&gt;</code> — ресурс не найден/ошибка вызова.</li>
             <li><code>handler not found: &lt;name&gt;</code> — в <code>handlers</code> нет такого имени.</li>
+            <li><code>ERR: stop scenario first</code> — попытка сохранить запущенный сценарий.</li>
         </ul>
 
-        <h3>10. Лимиты</h3>
+        <h3>12. Лимиты</h3>
         <ul>
             <li>Файлов в списке — до 30.</li>
-            <li>Правил в файле — до 8; bus-вызовов в правиле — до 4; аргументов в вызове — до 4.</li>
+            <li>Правил в файле — до 8; <code>cond</code> в правиле — до <code>MACRO_MAX_CONDS = 4</code>;
+                bus-вызовов в правиле — до 4; аргументов в вызове — до 4.</li>
             <li>Инструкций Lua на один вызов handler — <code>MACRO_LUA_MAX_OPS = 100000</code>.</li>
             <li>Бюджет heap модуля — 100 КБ; при превышении ~95% кнопка «Валидация макросов» показывает критическое состояние.</li>
         </ul>
 
-        <h3>11. Синтаксис cron</h3>
+        <h3>13. Синтаксис cron</h3>
         <p>
             6 полей (секунды минуты часы день месяца месяц день недели), необязательное 7-е — год.
             Допустимы <code>*</code>, <code>*/N</code>, <code>a-b</code>, <code>a-b/N</code>,

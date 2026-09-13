@@ -1,10 +1,7 @@
--- Демо: одна иголочка = один cron (в мета-конфиге).
+-- Демонстрация: cron прямо в правиле (when), без мета-окна.
 return {
-    desc = "every minute",
-    handlers = {
-        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
-    },
+    desc = "every minute via when.cron",
     rules = {
-        { run = "tick" },
+        { when = { cron = "0 * * * * *" }, call = "e7.brightness", args = { 8 } },
     },
 }

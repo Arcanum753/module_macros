@@ -11,6 +11,7 @@
 
 #include "ccronexpr.h"
 #include "EspLuaEngine/EspLuaEngine.h"
+#include "core_state/core_state_types.h"
 
 // Ограничения (модуль предназначен только для ESP32).
 // Бюджет heap модуля — MACRO_HEAP_BUDGET (100 КБ). Оценка: фиксированная
@@ -20,6 +21,7 @@
 #define MACRO_MAX_RULES       8      ///< максимум правил в одном файле
 #define MACRO_MAX_ACTIONS     4      ///< максимум bus-вызовов в одном правиле
 #define MACRO_CALL_MAX_ARGS   4      ///< максимум аргументов одного вызова
+#define MACRO_MAX_CONDS       4      ///< максимум cond-условий в одном правиле (AND)
 #define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button/on)
 #define MACRO_MAX_EVENT_SUBS  8      ///< максимум уникальных событий шины в подписке
 
@@ -60,21 +62,31 @@ typedef struct {
     String  spec;            ///< спецификатор (слова term/button или имя события)
 } MacroEvent;
 
+/// Одно cond-условие правила (структурно, без строковой сериализации)
+typedef struct {
+    String   res;            ///< "ns.field"
+    uint8_t  op;             ///< MACRO_COND_*
+    BusValue val;            ///< целевое значение (op != changed)
+} MacroCond;
+
 /// Одно правило файла (декларативное)
 typedef struct {
-    uint8_t   type;          ///< MACRO_RULE_*
+    uint8_t   type;          ///< MACRO_RULE_* (первичный триггер или COND/BODY)
     String    spec;          ///< cron / term / button / имя события
     cron_expr expr;          ///< разобранный cron (для MACRO_RULE_CRON)
     time_t    next;          ///< следующее срабатывание cron (0 — не инициализировано)
     bool      lastCond;      ///< прошлое состояние (фронт для cond/body)
 
-    // Условие: сериализованная цепочка "res|op|val" через ';' (AND)
-    String    condSpec;
-    String    lastVal;       ///< прошлое значение (для op=changed)
-    bool      haveLast;
+    // Составное условие when: 0..MACRO_MAX_CONDS cond-проверок (AND)
+    MacroCond conds[MACRO_MAX_CONDS];
+    uint8_t   nConds;
+    String    lastVals[MACRO_MAX_CONDS]; ///< прошлые значения (для op=changed)
+    bool      haveLast[MACRO_MAX_CONDS];
 
-    // Действие: либо handler (Lua), либо декларативные bus-вызовы
-    String    handler;       ///< run="имя" (пусто — декларативные calls)
+    // Действие: либо handler (Lua), либо setTarget, либо декларативные bus-вызовы
+    String    setTarget;     ///< set="ns.field" (пусто, если действие call/calls/run)
+    BusValue  setValue;      ///< значение для set (коэрсится к типу ресурса при вызове)
+    String    handler;       ///< run="имя" — тяжёлый путь (перечитывает файл и компилирует Lua)
     String    handlerArgs;   ///< сериализованные аргументы handler "i:1|s:foo"
     String    actions[MACRO_MAX_ACTIONS]; ///< "ns.func|i:1|s:foo"
     uint8_t   nActions;
@@ -89,7 +101,7 @@ typedef struct MacroFile {
     uint8_t   prio;          ///< приоритет 0..7 (0 — высший)
     bool      run;           ///< включён пользователем
     uint32_t  created;       ///< время создания (локальное, TimeLib)
-    String    metaCron;      ///< cron-выражение окна из web-таблицы (мета)
+    String    metaCron;      ///< cron-выражение окна (из поля meta_cron файла; "" = без гейта)
     uint32_t  size;          ///< размер файла на FS (кэш для веб-таблицы)
 
     // --- runtime-состояние (не сохраняется) ---
@@ -112,5 +124,12 @@ typedef struct MacroFile {
 typedef struct {
     bool enabled;            ///< модуль включён
 } strMacrosConfig;
+
+// Отладочная сериализация условий правила (собирается на месте, не хранится).
+String macroRuleCondStr(const MacroRule& r);
+// Текстовое имя оператора cond (обратное к macroOpCode).
+const char* macroCondOpName(uint8_t op);
+// Текстовое имя типа правила (для printList).
+const char* macroRuleTypeStr(uint8_t type);
 
 #endif // _MODULE_MACROS_ENGINE_h

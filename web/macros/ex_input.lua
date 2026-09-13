@@ -1,15 +1,9 @@
--- Демо: события терминала и кнопки (macro msg / macro btn).
--- Мета-cron пуст — сценарий активен всегда.
+-- Демонстрация: события терминала и кнопки — полностью декларативно.
 return {
-    desc = "term/button input demo (no meta window)",
-    handlers = {
-        temp  = function(ev) puts("sensor: temperature 25") end,
-        b1    = function(ev) puts("button1 on") end,
-        start = function(ev) puts("button start pressed") end,
-    },
+    desc = "term/button -> set resource",
     rules = {
-        { term = "temp 25", run = "temp" },
-        { term = "button1 on", run = "b1" },
-        { button = "start", run = "start" },
+        { when = { term = "temp 25" },    set = "e7.effect",     value = 1 },
+        { when = { term = "button1 on" }, set = "e7.brightness", value = 5 },
+        { when = { button = "start" },    call = "e7.speed",     args = { 50 } },
     },
 }

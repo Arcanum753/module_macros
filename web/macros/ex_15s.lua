@@ -1,10 +1,8 @@
--- Демо: одна иголочка = один cron (в мета-конфиге).
+-- Демонстрация: meta_cron (гейт) + декларативный bus-вызов функции.
 return {
-    desc = "every 15s",
-    handlers = {
-        tick = function(ev) puts(clock(), "fired:", ev.type, ev.spec) end,
-    },
+    desc = "every 15s: call e7.speed(50)",
+    meta_cron = "*/15 * * * * *",
     rules = {
-        { run = "tick" },
+        { call = "e7.speed", args = { 50 } },
     },
 }

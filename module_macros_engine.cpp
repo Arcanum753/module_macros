@@ -18,6 +18,10 @@
 // Единый счётчик VM-инструкций для защиты от «зависаний» сценария.
 static uint32_t macroLuaSteps = 0;
 
+// При валидации сценария (/macros/validate) bus-функции set/call/mode — no-op,
+// чтобы top-level чанка не давал побочных эффектов на шину.
+static bool macroValidateNoSideEffects = false;
+
 // Свободный хип для диагностики (ESP32-only модуль).
 static unsigned macroHeapFree() {
     unsigned v = 0;
@@ -53,6 +57,8 @@ static int macroParseArgs(const String& s, BusValue* out, int max);
 static String macroArgsToStr(lua_State* L, int argsIdx);
 static String macroValueToStr(lua_State* L, int idx);
 static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r);
+static String macroNumText(const BusValue& v);
+static int macroResolveEnum(const char* res, const BusValue& in, BusValue& out, String& err);
 
 // ============================================================
 // Защитный hook и ошибки
@@ -149,6 +155,38 @@ static bool macroLuaToBusValue(lua_State* L, int idx, BusValue& out) {
     return false;
 }
 
+// Форматтер числового/булева значения для сообщения об ошибке ENUM.
+// Контракт: вызывается ТОЛЬКО для kind == I32/F32/BOOL/TIME.
+// Для прочих kind возвращает "?" (защита от случайного вызова).
+static String macroNumText(const BusValue& v) {
+    switch (v.kind) {
+        case BusValue::I32:  return String((long)v.i);
+        case BusValue::TIME: return String((long)v.t);
+        case BusValue::BOOL: return String(v.b ? "true" : "false");
+        case BusValue::F32:  return String(v.f, 3);
+        default:             return String("?");
+    }
+}
+
+// Резолв значения для ENUM-ресурса: строка → индекс по enumVals (без учёта регистра),
+// ENUM → как есть, числовые (I32/F32/BOOL/TIME) → ошибка.
+// rc: BUS_OK / BUS_ERR_BAD_VALUE; err — человекочитаемая причина.
+static int macroResolveEnum(const char* res, const BusValue& in, BusValue& out, String& err) {
+    err = "";
+    if (in.kind == BusValue::ENUM) { out = in; return BUS_OK; }
+    if (in.kind == BusValue::STR) {
+        int idx = core_state.enumIndexByName(res, in.s.c_str(), nullptr);
+        if (idx < 0) {
+            err = String(res) + ": unknown enum value '" + in.s + "'";
+            return BUS_ERR_BAD_VALUE;
+        }
+        out = BusValue::en((int32_t)idx);
+        return BUS_OK;
+    }
+    err = String(res) + ": enum requires name, got number " + macroNumText(in);
+    return BUS_ERR_BAD_VALUE;
+}
+
 // ============================================================
 // Команды Lua, доступные внутри named-handler
 // ============================================================
@@ -171,12 +209,24 @@ static int macroLuaGet(lua_State* L) {
 }
 
 static int macroLuaSet(lua_State* L) {
+    if (macroValidateNoSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
     const char* name = luaL_checkstring(L, 1);
     if (core_state.has(name) == false) { lua_pushinteger(L, BUS_ERR_NOT_FOUND); return 1; }
     BusResInfo info;
     core_state.info(name, info);
     BusValue v;
     if (lua_gettop(L) >= 2) { macroLuaToBusValue(L, 2, v); }
+
+    // ENUM: строку резолвим в индекс, числа отвергаем (BUS_ERR_BAD_VALUE).
+    if (info.kind == BusValue::ENUM) {
+        BusValue rv;
+        String e;
+        if (macroResolveEnum(name, v, rv, e) != BUS_OK) {
+            lua_pushinteger(L, BUS_ERR_BAD_VALUE);
+            return 1;
+        }
+        v = rv;
+    }
 
     int rc = BUS_ERR_BAD_TYPE;
     if (info.isFunc && !info.async) {
@@ -199,6 +249,11 @@ static int macroLuaSet(lua_State* L) {
 }
 
 static int macroLuaCall(lua_State* L) {
+    if (macroValidateNoSideEffects) {
+        lua_pushnil(L);
+        lua_pushinteger(L, BUS_OK);
+        return 2;
+    }
     const char* name = luaL_checkstring(L, 1);
     int narg = lua_gettop(L) - 1;
     if (narg > CORE_STATE_MAX_ARGS) { narg = CORE_STATE_MAX_ARGS; }
@@ -207,6 +262,41 @@ static int macroLuaCall(lua_State* L) {
     for (int i = 0; i < narg; i++) {
         if (macroLuaToBusValue(L, 2 + i, args[argc])) { argc++; }
     }
+
+    // ENUM-функция (dual state+func, например wifi.mode): первый аргумент-строку
+    // резолвим в индекс; числа отвергаем.
+    BusResInfo info;
+    bool haveInfo = (core_state.info(name, info) == BUS_OK);
+    if (haveInfo && argc >= 1 && info.kind == BusValue::ENUM) {
+        BusValue rv;
+        String e;
+        if (macroResolveEnum(name, args[0], rv, e) != BUS_OK) {
+            lua_pushnil(L);
+            lua_pushinteger(L, BUS_ERR_BAD_VALUE);
+            return 2;
+        }
+        args[0] = rv;
+    }
+
+    // call на чистом state = set (идентично декларативному call/calls).
+    if (haveInfo && !info.isFunc && info.kind != BusValue::NONE) {
+        BusValue v = (argc > 0) ? args[0] : BusValue();
+        int src = BUS_ERR_BAD_TYPE;
+        switch (info.kind) {
+            case BusValue::BOOL: src = core_state.setBool(name, (v.kind == BusValue::BOOL) ? v.b : (v.i != 0)); break;
+            case BusValue::I32:  src = core_state.setInt(name, (int32_t)v.i); break;
+            case BusValue::ENUM: src = core_state.setInt(name, (int32_t)v.i); break;
+            case BusValue::F32:  src = core_state.setF32(name, v.f); break;
+            case BusValue::STR:  src = core_state.setStr(name, v.s); break;
+            case BusValue::TIME: src = core_state.setTime(name, v.t); break;
+            default: break;
+        }
+        if (src == BUS_OK) { lua_pushinteger(L, src); return 1; }
+        lua_pushnil(L);
+        lua_pushinteger(L, src);
+        return 2;
+    }
+
     BusValue result;
     int rc = core_state.call(name, argc, (argc > 0) ? args : nullptr, result);
     if (rc == BUS_OK) {
@@ -227,6 +317,7 @@ static int macroLuaHas(lua_State* L) {
 static int macroLuaMode(lua_State* L) {
     const char* ns = luaL_checkstring(L, 1);
     if (lua_gettop(L) >= 2) {
+        if (macroValidateNoSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
         int m = (int)luaL_checkinteger(L, 2);
         lua_pushinteger(L, core_state.mode(ns, m));
         return 1;
@@ -410,7 +501,11 @@ String macroRuleCondStr(const MacroRule& r) {
             switch (v.kind) {
                 case BusValue::BOOL: out += (v.b ? "true" : "false"); break;
                 case BusValue::I32:  out += String((long)v.i); break;
-                case BusValue::ENUM: out += String((long)v.i); break;
+                case BusValue::ENUM: {
+                    const char* nm = core_state.enumNameByIndex(r.conds[i].res.c_str(), (int)v.i);
+                    if (nm != nullptr) { out += nm; } else { out += String((long)v.i); }
+                    break;
+                }
                 case BusValue::F32:  out += String(v.f); break;
                 case BusValue::STR:  out += v.s; break;
                 case BusValue::TIME: out += String((long)v.t); break;
@@ -500,6 +595,22 @@ static bool macroCondAddOne(lua_State* L, MacroFile& f, int idx, MacroRule& r) {
             if (lua_isstring(L, -1)) { c.val = BusValue::str(String(lua_tostring(L, -1))); }
         }
         lua_pop(L, 1);
+
+        // Best-effort: для уже зарегистрированного ENUM-ресурса резолвим значение
+        // при парсинге (ранняя диагностика); иначе — резолв при исполнении.
+        if (core_state.has(res.c_str())) {
+            BusResInfo info;
+            core_state.info(res.c_str(), info);
+            if (info.kind == BusValue::ENUM) {
+                BusValue rv;
+                String e;
+                if (macroResolveEnum(res.c_str(), c.val, rv, e) != BUS_OK) {
+                    f.err = e;
+                    return false;
+                }
+                c.val = rv;
+            }
+        }
     }
     r.nConds++;
     return true;
@@ -662,6 +773,15 @@ static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
                 f.err = String("set: use call= for function resource ") + r.setTarget;
                 return false;
             }
+            if (info.kind == BusValue::ENUM) {
+                BusValue rv;
+                String e;
+                if (macroResolveEnum(r.setTarget.c_str(), r.setValue, rv, e) != BUS_OK) {
+                    f.err = e;
+                    return false;
+                }
+                r.setValue = rv;
+            }
         }
         return true;
     }
@@ -698,6 +818,25 @@ static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
                     lua_pop(L, 1);
                 }
                 if (name.length() > 0) {
+                    // Best-effort (только диагностика): числовой/невалидный ENUM-аргумент
+                    // отсекаем при парсинге; r.actions[] не трогаем (резолв при исполнении).
+                    if (args.length() > 0 && core_state.has(name.c_str())) {
+                        BusResInfo info;
+                        core_state.info(name.c_str(), info);
+                        if (info.kind == BusValue::ENUM) {
+                            BusValue av[MACRO_CALL_MAX_ARGS];
+                            int an = macroParseArgs(args, av, MACRO_CALL_MAX_ARGS);
+                            if (an > 0) {
+                                BusValue rv;
+                                String e;
+                                if (macroResolveEnum(name.c_str(), av[0], rv, e) != BUS_OK) {
+                                    lua_pop(L, 2);
+                                    f.err = e;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     String act = name;
                     if (args.length() > 0) { act += '|'; act += args; }
                     r.actions[r.nActions++] = act;
@@ -718,6 +857,24 @@ static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
     String cargs;
     if (lua_istable(L, -1)) { cargs = macroArgsToStr(L, lua_absindex(L, -1)); }
     lua_pop(L, 1);
+
+    // Best-effort (только диагностика): невалидный ENUM-аргумент — ошибка правила.
+    if (cargs.length() > 0 && core_state.has(cname.c_str())) {
+        BusResInfo info;
+        core_state.info(cname.c_str(), info);
+        if (info.kind == BusValue::ENUM) {
+            BusValue av[MACRO_CALL_MAX_ARGS];
+            int an = macroParseArgs(cargs, av, MACRO_CALL_MAX_ARGS);
+            if (an > 0) {
+                BusValue rv;
+                String e;
+                if (macroResolveEnum(cname.c_str(), av[0], rv, e) != BUS_OK) {
+                    f.err = e;
+                    return false;
+                }
+            }
+        }
+    }
     String act = cname;
     if (cargs.length() > 0) { act += '|'; act += cargs; }
     r.actions[r.nActions++] = act;
@@ -894,6 +1051,136 @@ bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
     return true;
 }
 
+/** Валидирует сценарий без регистрации файла: синтаксис, meta_cron и rules. */
+bool macroValidateScenario(EspLuaEngine& eng, const String& content, String& err) {
+    err = "";
+    lua_State* L = eng.getLuaState();
+    if (L == NULL) { err = "No interpreter"; return false; }
+
+    MacroFile tf;
+    tf.name = "@validate";
+    // На время исполнения top-level отключаем побочные bus-действия.
+    macroValidateNoSideEffects = true;
+    int status = macroLoadChunk(L, tf, content);
+    macroValidateNoSideEffects = false;
+    if (status != LUA_OK) {
+        err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error");
+        lua_settop(L, 0);
+        return false;
+    }
+    if (!lua_istable(L, -1)) {
+        err = "legacy/invalid format: expected table {handlers,rules}";
+        lua_settop(L, 0);
+        return false;
+    }
+    int tbl = lua_absindex(L, -1);
+
+    lua_getfield(L, tbl, "meta_cron");
+    String metaCron;
+    if (lua_isstring(L, -1)) { metaCron = String(lua_tostring(L, -1)); }
+    lua_pop(L, 1);
+    if (metaCron.length() > 0) {
+        cron_expr metaExpr;
+        memset(&metaExpr, 0, sizeof(metaExpr));
+        const char* perr = NULL;
+        cron_parse_expr(metaCron.c_str(), &metaExpr, &perr);
+        if (perr) {
+            err = String("meta_cron: ") + perr;
+            lua_settop(L, 0);
+            return false;
+        }
+    }
+
+    lua_getfield(L, tbl, "rules");
+    if (!lua_istable(L, -1)) {
+        err = "no rules table";
+        lua_settop(L, 0);
+        return false;
+    }
+    int rt = lua_absindex(L, -1);
+    int n = (int)lua_rawlen(L, rt);
+    if (n <= 0) {
+        err = "no rules";
+        lua_settop(L, 0);
+        return false;
+    }
+    if (n > MACRO_MAX_RULES) {
+        err = String("too many rules (max ") + String((unsigned)MACRO_MAX_RULES) + ")";
+        lua_settop(L, 0);
+        return false;
+    }
+
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, rt, i);
+        if (lua_istable(L, -1)) {
+            MacroRule r;
+            if (macroParseRule(L, tf, lua_absindex(L, -1), r) == false) {
+                err = (tf.err.length() > 0) ? tf.err : String("rule ") + String(i) + ": invalid";
+                lua_settop(L, 0);
+                return false;
+            }
+        }
+        lua_pop(L, 1);
+    }
+    lua_settop(L, 0);
+    return true;
+}
+
+/** Читает только desc/meta_cron сценария (без разбора rules). */
+bool macroReadScenarioMeta(EspLuaEngine& eng, const String& content,
+                           String& desc, String& metaCron, String& err) {
+    desc = "";
+    metaCron = "";
+    err = "";
+    lua_State* L = eng.getLuaState();
+    if (L == NULL) { err = "No interpreter"; return false; }
+
+    MacroFile tf;
+    tf.name = "@meta";
+    // На время исполнения top-level отключаем побочные bus-действия.
+    macroValidateNoSideEffects = true;
+    int status = macroLoadChunk(L, tf, content);
+    macroValidateNoSideEffects = false;
+    if (status != LUA_OK) {
+        err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error");
+        lua_settop(L, 0);
+        return false;
+    }
+    if (!lua_istable(L, -1)) {
+        err = "legacy/invalid format: expected table {handlers,rules}";
+        lua_settop(L, 0);
+        return false;
+    }
+    int tbl = lua_absindex(L, -1);
+
+    lua_getfield(L, tbl, "desc");
+    if (lua_isstring(L, -1)) { desc = String(lua_tostring(L, -1)); }
+    lua_pop(L, 1);
+
+    lua_getfield(L, tbl, "meta_cron");
+    if (lua_isstring(L, -1)) { metaCron = String(lua_tostring(L, -1)); }
+    lua_pop(L, 1);
+
+    lua_settop(L, 0);
+    return true;
+}
+
+/** Заполняет desc/meta_cron остановленного файла (без разбора правил). */
+void CLASS_MODULE_MACROS::refreshFileMeta(MacroFile& f) {
+    if (f.active) { return; }                 // активный уже заполнен registerFile
+    if (_fs == NULL || _fs->exists(f.name) == false) { return; }
+    if (initLua() == false) { return; }
+
+    String content = readFile(f.name);
+    if (content.length() == 0) { return; }
+
+    String desc, cron, err;
+    if (macroReadScenarioMeta(*_lua, content, desc, cron, err)) {
+        f.desc = desc;
+        f.metaCron = cron;
+    }
+}
+
 /** Пере(регистрирует) только помеченные файлы (needParse), не более N за тик. */
 void CLASS_MODULE_MACROS::rebuildScripts() {
     uint8_t done = 0;
@@ -901,7 +1188,9 @@ void CLASS_MODULE_MACROS::rebuildScripts() {
         MacroFile& f = _files[i];
         if (f.run == false) {
             if (f.active) { unregisterFile(f); }
-            f.needParse = false;
+            // Остановленный файл: при пометке обновляем только desc/meta_cron
+            // (для веб-таблицы), правила не разбираем.
+            if (f.needParse) { refreshFileMeta(f); f.needParse = false; }
             continue;
         }
         if (f.needParse == false) { continue; }
@@ -991,15 +1280,24 @@ static void macroRunActions(MacroFile& f, MacroRule& r) {
         BusResInfo info;
         int rc = BUS_ERR_NOT_FOUND;
         if (core_state.info(r.setTarget.c_str(), info) == BUS_OK) {
+            // Обязательный резолв ENUM с актуальным info (поздняя регистрация ресурса):
+            // строку приводим к индексу, числа отвергаем — до ветвления isFunc/state.
+            BusValue val = r.setValue;
+            if (info.kind == BusValue::ENUM) {
+                String e;
+                if (macroResolveEnum(r.setTarget.c_str(), val, val, e) != BUS_OK) {
+                    f.err = e;
+                    return;
+                }
+            }
             if (info.isFunc && !info.async) {
                 // dual state+func: применяем значение через write-функцию
-                BusValue arg = r.setValue;
                 BusValue res;
-                rc = core_state.call(r.setTarget.c_str(), 1, &arg, res);
+                rc = core_state.call(r.setTarget.c_str(), 1, &val, res);
                 (void)res;   // результат write-функции не используется
             } else if (info.kind != BusValue::NONE) {
                 // чистое состояние: коэрсим значение и обновляем реестр
-                BusValue coerced = core_state.valueToKind(r.setValue, info.kind);
+                BusValue coerced = core_state.valueToKind(val, info.kind);
                 switch (info.kind) {
                     case BusValue::BOOL: rc = core_state.setBool(r.setTarget.c_str(), coerced.b); break;
                     case BusValue::I32:  rc = core_state.setInt(r.setTarget.c_str(), coerced.i); break;
@@ -1032,6 +1330,17 @@ static void macroRunActions(MacroFile& f, MacroRule& r) {
         }
         BusResInfo info;
         core_state.info(name.c_str(), info);
+
+        // Обязательный резолв ENUM-аргумента до ветвления isFunc/state.
+        if (info.kind == BusValue::ENUM && argc > 0) {
+            BusValue rv;
+            String e;
+            if (macroResolveEnum(name.c_str(), av[0], rv, e) != BUS_OK) {
+                f.err = e;
+                continue;
+            }
+            av[0] = rv;
+        }
 
         int rc = BUS_ERR_BAD_TYPE;
         if (info.isFunc && !info.async) {
@@ -1097,7 +1406,17 @@ bool CLASS_MODULE_MACROS::evalConds(MacroFile& f, MacroRule& r, String& errTxt) 
             r.haveLast[i] = true;
             if (!changed) { all = false; }
         } else {
-            if (macroCompare(cur, c.op, c.val) == false) { all = false; }
+            // Резолв ENUM-значения cond (обязательный: ресурс мог зарегистрироваться
+            // после парсинга). Числовые значения для ENUM отвергаются.
+            BusValue want = c.val;
+            if (cur.kind == BusValue::ENUM) {
+                String e;
+                if (macroResolveEnum(c.res.c_str(), c.val, want, e) != BUS_OK) {
+                    errTxt = e;
+                    return false;
+                }
+            }
+            if (macroCompare(cur, c.op, want) == false) { all = false; }
         }
     }
     return all;

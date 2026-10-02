@@ -91,6 +91,7 @@ private:
     void unregisterFile(MacroFile& f);       // снять правила и подписки
     void rebuildScripts();                   // (пере)регистрация только needParse
     bool anyNeedParse();                     // есть ли файлы, требующие разбора
+    void refreshFileMeta(MacroFile& f);      // читать desc/meta_cron без разбора правил
     void fireRule(MacroFile& f, MacroRule& r);// исполнить действие правила
     String runHandler(MacroFile& f, MacroRule& r); // вызвать named-handler (Lua)
     bool evalConds(MacroFile& f, MacroRule& r, String& errTxt); // составное условие (AND)
@@ -114,8 +115,8 @@ protected:
     struct { String name; uint32_t handle; } _evtSubs[MACRO_MAX_EVENT_SUBS];
     uint8_t _nEvtSubs;
 
-    String _resourcesJson;    // кэш каталога ресурсов (собирается один раз)
-    bool   _resourcesReady;
+    String _resourcesJson;    // последний успешный каталог ресурсов (fallback)
+    bool   _resourcesReady;   // в _resourcesJson лежит валидная строка
 
     MacroEvent _evQueue[MACRO_EV_QUEUE];     // очередь внешних событий (term/button/on)
     uint8_t _evIn;

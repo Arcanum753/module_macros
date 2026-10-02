@@ -357,11 +357,22 @@
 
         // ---- Подсветка Lua через CSS-оверлей ----
         function highlight(src) {
-            let out = esc(src);
-            out = out.replace(/(--[^\n]*)/g, '<span class="cmt">$1</span>');
-            out = out.replace(/(&quot;|&#39;|"[^"]*"|'[^']*')/g, '<span class="str">$1</span>');
-            out = out.replace(/\b(function|end|if|then|else|elseif|local|return|nil|true|false|and|or|not|for|while|do|break|repeat|until|in)\b/g, '<span class="kw">$1</span>');
-            out = out.replace(/\b(\d+)\b/g, '<span class="num">$1</span>');
+            var out = esc(src);
+            var re = new RegExp(
+                '(--[^\\n]*)' +
+                '|("[^"\\n]*"|\'[^\'\\n]*\')' +
+                '|\\b(function|end|if|then|else|elseif|local|return|nil|true|false' +
+                '|and|or|not|for|while|do|break|repeat|until|in)\\b' +
+                '|\\b(\\d+)\\b',
+                'g'
+            );
+            out = out.replace(re, function (m, cmt, str, kw, num) {
+                if (cmt) { return '<span class="cmt">' + cmt + '</span>'; }
+                if (str) { return '<span class="str">' + str + '</span>'; }
+                if (kw)  { return '<span class="kw">'  + kw  + '</span>'; }
+                if (num) { return '<span class="num">' + num + '</span>'; }
+                return m;
+            });
             return out + '\n';
         }
         function onEdit() {
@@ -400,7 +411,9 @@
                     const el = document.createElement('div');
                     el.className = 'res';
                     const flags = (r.rw ? 'rw ' : '') + (r.e ? 'e ' : '') + (r.a ? 'a ' : '');
-                    el.innerText = '• ' + r.name + ' [' + r.kind + '] ' + flags;
+                    let label = '• ' + r.name + ' [' + r.kind + '] ' + flags;
+                    if (r.kind === 'ENUM' && r.valueName) { label += '= ' + r.valueName; }
+                    el.innerText = label;
                     el.onclick = () => showProps(r);
                     el.ondblclick = () => insertSnippet(r);
                     tree.appendChild(el);
@@ -410,7 +423,18 @@
         function showProps(r) {
             let h = '<b>' + esc(r.full) + '</b><br>' + esc(r.desc || '');
             h += '<br>kind: ' + r.kind + ' | ro: ' + !r.rw + ' | func: ' + !!r.f + ' | async: ' + !!r.a + ' | event: ' + !!r.e;
-            if (r.enum) { h += '<br>enum: ' + r.enum.join(', '); }
+            if (r.kind === 'ENUM') {
+                if (r.valueName) {
+                    const idx = (typeof r.value === 'number') ? ' (' + r.value + ')' : '';
+                    h += '<br>current: <b>' + esc(r.valueName) + '</b>' + idx;
+                } else if (typeof r.value === 'number') {
+                    h += '<br>current: ' + r.value;
+                }
+            }
+            if (r.enum) {
+                h += '<br>enum: ' + r.enum.map(v =>
+                    (r.valueName && v === r.valueName) ? '<b>' + esc(v) + '</b>' : esc(v)).join(', ');
+            }
             if (r.codes) { r.codes.forEach(c => { h += '<br>code ' + c.code + ': ' + esc(c.meaning); }); }
             document.getElementById('propPanel').innerHTML = h;
         }
@@ -418,8 +442,18 @@
             if (CUR_EDIT_RUN) { return; }   // запущенный сценарий — только просмотр
             const ta = document.getElementById('lua');
             let s;
-            if (r.f) { s = (r.a ? '-- async: вызывается движком, без callback\n' : '') + 'call("' + r.full + '")'; }
-            else { s = 'get("' + r.full + '")'; }
+            if (r.kind === 'ENUM') {
+                const cur = r.valueName || (r.enum && r.enum[0]) || '';
+                if (cur) {
+                    s = (r.f ? 'call("' + r.full + '", "' : 'set("' + r.full + '", "') + cur + '")';
+                } else {
+                    s = '-- ' + r.full + ': enum (значение неизвестно)';
+                }
+            } else if (r.f) {
+                s = (r.a ? '-- async: вызывается движком, без callback\n' : '') + 'call("' + r.full + '")';
+            } else {
+                s = 'get("' + r.full + '")';
+            }
             const p = ta.selectionStart;
             ta.value = ta.value.slice(0, p) + s + ta.value.slice(ta.selectionEnd);
             ta.selectionStart = ta.selectionEnd = p + s.length;

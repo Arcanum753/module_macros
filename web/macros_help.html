@@ -96,6 +96,16 @@
         <p>Больше одного действия — ошибка <code>rule has multiple actions</code>. Если функция шины
         асинхронная, движок вызывает её сам (результат пишется в лог); из Lua асинхронные вызовы
         недоступны.</p>
+        <div class="note">
+            Для <b>ENUM-ресурсов</b> (например <code>wifi.target</code>, <code>wifi.mode</code>)
+            значение <code>value</code> задаётся <b>только буквенным именем</b> из каталога ресурсов:
+            <code>{ set = "wifi.target", value = "ap" }</code>. Числа для ENUM отвергаются —
+            <code>enum requires name, got number N</code>.<br>
+            В панели <b>Resources</b> текущее значение ENUM показывается буквенным именем
+            (<code>• target [ENUM] rw = sta</code>), а двойной клик вставляет готовый сниппет с
+            буквой: <code>set("wifi.target", "sta")</code> (для dual state+func —
+            <code>call("wifi.mode", "macro")</code>).
+        </div>
 
         <h3>5. Когда использовать `run`</h3>
         <p>
@@ -119,6 +129,11 @@
 { when = { cron = "0 * * * * *", cond = {
       {res="wifi.connected", op="==", val=true},
       {res="time.valid",     op="==", val=true} } }, run = "onOk" }</pre>
+        <div class="note">
+            Для <b>ENUM-ресурсов</b> <code>val</code> — буквенное имя:
+            <code>{ res = "wifi.target", op = "==", val = "sta" }</code>. Числовое значение для ENUM —
+            ошибка правила (<code>enum requires name, got number N</code>).
+        </div>
 
         <h3>7. `set` на ресурсах с write-функцией</h3>
         <p>
@@ -178,6 +193,15 @@
             <b>Нет</b> <code>on</code>/<code>off</code>/<code>call_async</code> — события оформляются
             правилом <code>on</code>, асинхронность — на стороне движка. Всё это доступно только
             внутри <code>run=</code>-пути.</p>
+        <div class="note">
+            <code>get("wifi.target")</code> для ENUM возвращает <b>число</b> (0/1/2). Чтобы получить
+            имя: <code>info("wifi.target").enum[get("wifi.target") + 1]</code>. Запись
+            (<code>set</code>/<code>call</code>) принимает буквенное имя, не число.
+            <code>call("ns.field", …)</code> на чистом state-ресурсе работает как
+            <code>set</code>.<br>
+            Дерево <b>Resources</b> в UI для ENUM вставляет именно <b>запись</b> с буквой
+            (<code>set</code>/<code>call</code>), а не <code>get</code>: чтение через
+            <code>get</code> вернёт число.</div>
         <p>Handler получает один аргумент — таблицу события:</p>
         <ul>
             <li><code>ev.type</code> — <code>"cron"|"cond"|"term"|"button"|"on"|"body"</code>;</li>
@@ -199,6 +223,9 @@
             <li><code>rule has no action (set/call/calls/run)</code> — действие не задано.</li>
             <li><code>set: use call= for function resource &lt;name&gt;</code> — ресурс — чистая функция.</li>
             <li><code>set: value required</code> — у <code>set</code> нет значения.</li>
+            <li><code>enum requires name, got number N</code> — числовое значение для ENUM-ресурса
+                (допустимо только буквенное имя).</li>
+            <li><code>unknown enum value 'foo'</code> — неизвестное имя ENUM-значения.</li>
             <li><code>cron error: ...</code> — невалидный cron в правиле или в мете.</li>
             <li><code>File is empty or unreadable</code> — файл пуст/недоступен.</li>
             <li><code>No memory for interpreter</code> / <code>No memory for rules</code> — не хватило heap; авто-повтор ограничен, затем нажмите <b>Reload</b>.</li>

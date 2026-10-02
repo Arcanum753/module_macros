@@ -113,6 +113,12 @@ void CLASS_MODULE_MACROS::begin() {
     markAllDirty();
     while (anyNeedParse()) { rebuildScripts(); }
 
+    // Заполняем desc/meta_cron и для остановленных сценариев: страница должна
+    // показывать окно и описание файла без его запуска.
+    for (uint8_t i = 0; i < _fileCount; i++) {
+        if (_files[i].active == false) { refreshFileMeta(_files[i]); }
+    }
+
     // Периодическая задача исполнительной машины (раз в секунду)
     SetTimerTask(macroTickTask, 1000);
 
@@ -485,23 +491,42 @@ void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
-    // Каталог ресурсов статичен после старта: собираем один раз (пока heap высок)
-    // и стримим из памяти, без JsonDocument и аллокаций на каждый запрос.
-    if (ESP.getMaxAllocHeap() < 8000) {
+    // Каталог содержит текущие значения ENUM-ресурсов, поэтому пересобираем его
+    // на каждый запрос. Последняя удачная строка остаётся как fallback при
+    // нехватке heap/overflow и стримится без повторной сборки.
+    // Сборка требует JsonDocument + временную String + копию в _resourcesJson,
+    // поэтому порог зависит от размера каталога (с минимумом 8000 на первый сбор).
+    size_t need = _resourcesJson.length() + 4096;
+    if (need < 8000) { need = 8000; }
+    if (ESP.getMaxAllocHeap() < need) {
+        if (_resourcesReady && _resourcesJson.length() > 0) {
+            AsyncResponseStream *resp = request->beginResponseStream("application/json");
+            resp->print(_resourcesJson);
+            request->send(resp);
+            return;
+        }
         request->send(503, "text/plain", "ERR: low memory");
         return;
     }
-    if (_resourcesReady == false) {
-        JsonDocument doc;
-        core_state.catalogToJson(doc);
-        if (doc.overflowed()) {
-            request->send(500, "text/plain", "ERR: catalog too large");
+
+    JsonDocument doc;
+    core_state.catalogToJson(doc);
+    if (doc.overflowed()) {
+        if (_resourcesReady && _resourcesJson.length() > 0) {
+            AsyncResponseStream *resp = request->beginResponseStream("application/json");
+            resp->print(_resourcesJson);
+            request->send(resp);
             return;
         }
-        _resourcesJson = "";
-        serializeJson(doc, _resourcesJson);
-        _resourcesReady = true;
+        request->send(500, "text/plain", "ERR: catalog too large");
+        return;
     }
+
+    String out;
+    serializeJson(doc, out);
+    _resourcesJson = out;
+    _resourcesReady = true;
+
     AsyncResponseStream *resp = request->beginResponseStream("application/json");
     resp->print(_resourcesJson);
     request->send(resp);
@@ -532,6 +557,14 @@ void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
             const char* s = lua_tolstring(eng.getLuaState(), -1, &len);
             String e = (s != NULL) ? String(s) : String("syntax error");
             request->send(200, "text/plain", String("ERROR: lua: ") + e);
+            return;
+        }
+        lua_pop(eng.getLuaState(), 1);
+
+        // Семантическая валидация rules/meta_cron (ENUM-имена, cron-ошибки).
+        String rerr;
+        if (macroValidateScenario(eng, body, rerr) == false) {
+            request->send(200, "text/plain", String("ERROR: rules: ") + rerr);
             return;
         }
     }

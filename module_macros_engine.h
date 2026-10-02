@@ -132,4 +132,14 @@ const char* macroCondOpName(uint8_t op);
 // Текстовое имя типа правила (для printList).
 const char* macroRuleTypeStr(uint8_t type);
 
+// Валидация сценария без регистрации файла: синтаксис + rules + meta_cron.
+// Возвращает true, если ошибок нет; err — первая ошибка. Стек Lua очищается.
+bool macroValidateScenario(EspLuaEngine& eng, const String& content, String& err);
+
+// Читает только описательные поля сценария (desc, meta_cron) без разбора rules —
+// для заполнения веб-таблицы у остановленных файлов. bus-функции на время
+// исполнения top-level — no-op (без побочных эффектов). Стек Lua очищается.
+bool macroReadScenarioMeta(EspLuaEngine& eng, const String& content,
+                           String& desc, String& metaCron, String& err);
+
 #endif // _MODULE_MACROS_ENGINE_h

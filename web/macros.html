@@ -3,6 +3,7 @@
 <head>
     <title>Macros</title>
     <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="style.css">
     <style>
         .macros-layout { display: flex; gap: 6px; padding: 6px; align-items: stretch; height: calc(100vh - 150px); min-height: 420px; }
@@ -13,10 +14,13 @@
         body.split-drag { cursor: col-resize; user-select: none; }
         .panel { border: 1px solid #bbb; background: #fff; overflow: auto; flex: 1 1 auto; }
         .panel h4 { margin: 0; padding: 4px 6px; background: #eee; border-bottom: 1px solid #ccc; font-size: 13px; }
-        #macTable { width: 100%; border-collapse: collapse; font-size: 12px; }
-        #macTable th, #macTable td { border-bottom: 1px solid #e0e0e0; padding: 2px 4px; text-align: left; }
-        #macTable tr.chk-sel { background: #fff7d6; }
-        #macTable tr.sel { background: #dce7ff; }
+        #macTable { width: 100%; border-collapse: collapse; font-size: 12px; border: 1px solid #c0c0c0; }
+        #macTable th, #macTable td { border: 1px solid #d0d0d0; padding: 2px 4px; text-align: left; }
+        #macTable th { background: #eee; }
+        #macTable tbody tr:nth-child(even) { background: #f2f2f2; }
+        #macTable tbody tr.chk-sel { background: #fff7d6; }
+        #macTable tbody tr.sel { background: #dce7ff; }
+        #macTable th:nth-child(5), #macTable td:nth-child(5) { white-space: nowrap; }
         #macTable button.mini { font-size: 11px; line-height: 1; padding: 1px 3px; cursor: pointer; }
         #macTable button.mini.active { background: #7D8EE2; color: #fff; border-color: #5a6cc0; }
         .iconbar { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }

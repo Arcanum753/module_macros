@@ -19,6 +19,9 @@
 
 Содержимое:
 - веб-страница-менеджер файлов сценариев (`/macros.html`);
+- веб-страница управления модулями (`/state.html`): список namespace и переключение режимов
+  `off/auto/macro` (перенесена из `core_state`; данные — через `core_state.modulesInfo()`,
+  смена — через `core_state.moduleMode()`);
 - набор Lua-сценариев в папке файловой системы `/macros/*.lua`;
 - интерпретатор **Lua 5.4.7** (движок **EspLuaEngine**, вендорен в `EspLuaEngine/`);
 - планировщик cron на базе **ccronexpr** (supertinycron) + time-мост на `common/TimeLib`;
@@ -163,7 +166,9 @@ spiffs 1336 КБ. Остальные env используют `partitions_esp32.
 | `/macros/validate?cron=&body=` | валидация cron, синтаксиса Lua и `rules`/`meta_cron` (включая ENUM-имена) |
 | `/macros/get?name=` | чтение содержимого сценария |
 | `/macros/save?name=&body=` | запись содержимого сценария |
-| `/macros/ver` | версия модуля |
+| `/macros/ver` | версия модуля (также используется страницей `state.html`) |
+| `/state/modules` | JSON-список модулей (namespace) и их режимов (для `state.html`) |
+| `/state/module_mode?ns=&mode=` | смена режима модуля `off/auto/macro` (перенесено из `core_state`) |
 
 Файлы `.lua` открываются в `module_editor` (`edit.html`) как текстовые (расширение `lua`
 добавлено в распознавание текста редактора).
@@ -492,6 +497,7 @@ flash. В сценариях доступен только язык Lua + фун
 | `cron_time_bridge.cpp` | функции времени ccronexpr на базе `common/TimeLib` |
 | `module_macros.ini` | env-окружение `esp32_macrotest` |
 | `web/macros.html` | веб-менеджер (таблица, кнопки, справка CRON/Lua) |
+| `web/state.html` | страница управления модулями (namespace + режимы off/auto/macro) |
 | `web/config_macros.json` | дефолтный мета-конфиг в образе FS |
 | `web/macros/*.lua` | файлы-примеры сценариев |
 | `module_macros_version.h` | версия модуля (автогенерация) |

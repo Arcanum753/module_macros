@@ -236,6 +236,18 @@ void CLASS_MODULE_MACROS::web_Init() {
     ESPHTTPServer.on("/macros/ver", HTTP_GET, [this](AsyncWebServerRequest *request) {
         this->html_ver_get(request);
     });
+
+    // Управление модулями (перенесено из core_state): список модулей и их режимы,
+    // смена режима off/auto/macro. URL сохранены для страницы state.html.
+    ESPHTTPServer.on("/state/modules", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleModules(request);
+    });
+
+    ESPHTTPServer.on("/state/module_mode", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
+        this->handleModuleMode(request);
+    });
 }
 
 // ============================================================
@@ -488,6 +500,44 @@ void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
         return;
     }
     request->send(200, "text/plain", readFile(MACROS_DIR_RE + base));
+}
+
+// Список модулей (namespace) с режимами — страница управления модулями (state.html).
+// Перенесено из core_state; данные берутся через core_state.modulesInfo().
+void CLASS_MODULE_MACROS::handleModules(AsyncWebServerRequest *request) {
+    BusModuleInfo mods[CORE_STATE_MAX_NS];
+    uint8_t n = core_state.modulesInfo(mods, CORE_STATE_MAX_NS);
+
+    JsonDocument doc;
+    doc["macros_available"] = 1;   // страница существует только в сборке с macros
+    JsonArray arr = doc["modules"].to<JsonArray>();
+    for (uint8_t i = 0; i < n; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["ns"] = mods[i].name;
+        o["privileged"] = mods[i].privileged ? 1 : 0;
+        o["prio"] = mods[i].prio;
+        o["has_mode"] = (mods[i].mode >= 0) ? 1 : 0;
+        o["mode"] = mods[i].mode;
+        o["desc"] = (mods[i].desc != nullptr) ? mods[i].desc : "";
+    }
+
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+}
+
+// Смена режима модуля: off/auto/macro. Перенесено из core_state.
+void CLASS_MODULE_MACROS::handleModuleMode(AsyncWebServerRequest *request) {
+    if (!request->hasArg("ns") || !request->hasArg("mode")) {
+        request->send(200, "text/plain", "ERR: no ns/mode");
+        return;
+    }
+    int rc = core_state.moduleMode(request->arg("ns").c_str(), request->arg("mode").toInt());
+    if (rc == BUS_OK) {
+        request->send(200, "text/plain", "OK");
+    } else {
+        request->send(200, "text/plain", ns_core_state::busErrStr(rc));
+    }
 }
 
 void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {

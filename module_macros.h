@@ -58,6 +58,9 @@ private:
     void handleHeap(AsyncWebServerRequest *request);
     void handleWrite(AsyncWebServerRequest *request);
     void handleGet(AsyncWebServerRequest *request);
+    // Управление модулями (перенесено из core_state): список и смена режима.
+    void handleModules(AsyncWebServerRequest *request);
+    void handleModuleMode(AsyncWebServerRequest *request);
 
     // Конфиг
     void defaultConfig();

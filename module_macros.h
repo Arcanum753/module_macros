@@ -125,6 +125,8 @@ protected:
     uint8_t _evIn;
     uint8_t _evOut;
 
+    time_t _lastTickNow = 0;   // now() прошлого тика (детект скачка времени)
+
     friend void macroTickTask();   // 1-сек задача EERTOS
     friend void macroCmd();        // обработчик терминальной команды "macro"
 };

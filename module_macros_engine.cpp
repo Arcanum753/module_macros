@@ -148,10 +148,16 @@ static void macroPushBusValue(lua_State* L, const BusValue& v) {
 }
 
 static bool macroLuaToBusValue(lua_State* L, int idx, BusValue& out) {
-    if (lua_isboolean(L, idx)) { out = BusValue::bo(lua_toboolean(L, idx) != 0); return true; }
-    if (lua_isinteger(L, idx)) { out = BusValue::i32((int32_t)lua_tointeger(L, idx)); return true; }
-    if (lua_isnumber(L, idx))  { out = BusValue::f32((float)lua_tonumber(L, idx)); return true; }
-    if (lua_isstring(L, idx))  { out = BusValue::str(String(lua_tostring(L, idx))); return true; }
+    // lua_type, а не lua_isnumber: lua_isnumber() истинно и для числовых СТРОК,
+    // из-за чего "0"/"1" превращались в F32 и STR-функции (wifi.set_slot) получали пустую строку.
+    int t = lua_type(L, idx);
+    if (t == LUA_TBOOLEAN) { out = BusValue::bo(lua_toboolean(L, idx) != 0); return true; }
+    if (t == LUA_TNUMBER) {
+        if (lua_isinteger(L, idx)) { out = BusValue::i32((int32_t)lua_tointeger(L, idx)); }
+        else { out = BusValue::f32((float)lua_tonumber(L, idx)); }
+        return true;
+    }
+    if (t == LUA_TSTRING) { out = BusValue::str(String(lua_tostring(L, idx))); return true; }
     return false;
 }
 
@@ -291,8 +297,10 @@ static int macroLuaCall(lua_State* L) {
             case BusValue::TIME: src = core_state.setTime(name, v.t); break;
             default: break;
         }
-        if (src == BUS_OK) { lua_pushinteger(L, src); return 1; }
-        lua_pushnil(L);
+        // Всегда (value, rc): успех тоже возвращает код, чтобы `v, rc = call(...)`
+        // давал rc без ветвления в сценарии.
+        BusValue rv = core_state.valueToKind(v, info.kind);
+        macroPushBusValue(L, rv);
         lua_pushinteger(L, src);
         return 2;
     }
@@ -301,7 +309,8 @@ static int macroLuaCall(lua_State* L) {
     int rc = core_state.call(name, argc, (argc > 0) ? args : nullptr, result);
     if (rc == BUS_OK) {
         macroPushBusValue(L, result);
-        return 1;
+        lua_pushinteger(L, rc);
+        return 2;
     }
     lua_pushnil(L);
     lua_pushinteger(L, rc);
@@ -397,14 +406,17 @@ static int macroLuaClock(lua_State* L) {
 // ============================================================
 
 static String macroValueToStr(lua_State* L, int idx) {
-    if (lua_isboolean(L, idx)) { return String(lua_toboolean(L, idx) ? "b:1" : "b:0"); }
-    if (lua_isinteger(L, idx)) {
-        char b[24]; snprintf(b, sizeof(b), "i:%ld", (long)lua_tointeger(L, idx)); return String(b);
-    }
-    if (lua_isnumber(L, idx)) {
+    // lua_type, а не lua_isnumber: числовая строка ("0") должна остаться s:0 (STR),
+    // иначе STR-функции шины (wifi.set_slot) получают F32 и читают пустую строку.
+    int t = lua_type(L, idx);
+    if (t == LUA_TBOOLEAN) { return String(lua_toboolean(L, idx) ? "b:1" : "b:0"); }
+    if (t == LUA_TNUMBER) {
+        if (lua_isinteger(L, idx)) {
+            char b[24]; snprintf(b, sizeof(b), "i:%ld", (long)lua_tointeger(L, idx)); return String(b);
+        }
         char b[32]; snprintf(b, sizeof(b), "f:%.4f", (double)lua_tonumber(L, idx)); return String(b);
     }
-    if (lua_isstring(L, idx)) { return String("s:") + String(lua_tostring(L, idx)); }
+    if (t == LUA_TSTRING) { return String("s:") + String(lua_tostring(L, idx)); }
     return String("s:");
 }
 
@@ -1368,6 +1380,9 @@ static void macroRunActions(MacroFile& f, MacroRule& r) {
 }
 
 void CLASS_MODULE_MACROS::fireRule(MacroFile& f, MacroRule& r) {
+    // Единый лог срабатывания правила (все типы: cron/cond/term/button/on/body).
+    DEBUGMACROS("[MACRO] %s fired %s(%s)\r\n", f.name.c_str(), macroRuleTypeName(r.type),
+                (r.type == MACRO_RULE_COND) ? macroRuleCondStr(r).c_str() : r.spec.c_str());
     if (r.handler.length() > 0) {
         String err = runHandler(f, r);
         if (err.length() > 0) {
@@ -1508,8 +1523,6 @@ void CLASS_MODULE_MACROS::drainEvents() {
                 bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
                 if (errTxt.length() > 0) { f.err = errTxt; continue; }
                 if (ok) {
-                    DEBUGMACROS("[MACRO] %s %s \"%s\" fired\r\n",
-                                f.name.c_str(), macroRuleTypeName(r.type), ev.spec.c_str());
                     fireRule(f, r);
                 }
             }
@@ -1536,6 +1549,35 @@ void CLASS_MODULE_MACROS::tickStep() {
         }
     }
 
+    // Скачок времени (NTP-синк, смена TZ, ручной time.set, откат источника): cron-правила
+    // пропускают «прошлые» срабатывания — next пересчитывается без выполнения.
+    time_t tNow = (time_t)now();
+    int64_t tickDiff = (int64_t)tNow - (int64_t)_lastTickNow;
+    bool bigJump = (_lastTickNow == 0)
+        || (tickDiff > MACRO_CRON_JUMP_MAX_S) || (tickDiff < -MACRO_CRON_JUMP_MAX_S);
+    if (bigJump) {
+        // База пересчёта next — максимум текущего и предыдущего такта: после ОТКАТА
+        // времени next уходит за уже пройденную (в прежней шкале) точку, поэтому при
+        // «догоне» правило не срабатывает повторно.
+        time_t base = (tNow > _lastTickNow) ? tNow : _lastTickNow;
+        DEBUGMACROS("[MACRO] time jump %+lds, re-arm cron (no fire)\r\n",
+                    (long)(tNow - _lastTickNow));
+        for (uint8_t i = 0; i < _fileCount; i++) {
+            MacroFile& f = _files[i];
+            if (f.run == false || f.active == false || f.rules == NULL) { continue; }
+            for (uint8_t j = 0; j < f.nRules; j++) {
+                MacroRule& r = f.rules[j];
+                if (r.type == MACRO_RULE_CRON) {
+                    if (r.next == 0 || r.next == (time_t)-1) { continue; }
+                    r.next = cron_next(&r.expr, base);
+                } else if (r.type == MACRO_RULE_COND || r.type == MACRO_RULE_BODY) {
+                    r.lastCond = false;   // сброс фронта после скачка
+                }
+            }
+        }
+    }
+    _lastTickNow = tNow;
+
     for (uint8_t i = 0; i < _fileCount; i++) {
         MacroFile& f = _files[i];
         if (f.run == false || f.active == false || f.rules == NULL) { continue; }
@@ -1554,14 +1596,12 @@ void CLASS_MODULE_MACROS::tickStep() {
                 if (f.metaCron.length() > 0) {
                     if (gate && r.lastCond == false) {
                         r.lastCond = true;
-                        DEBUGMACROS("[MACRO] %s body(meta)\r\n", f.name.c_str());
                         fireRule(f, r);
                     } else if (gate == false) {
                         r.lastCond = false;
                     }
                 } else if (r.lastCond == false) {
                     r.lastCond = true;
-                    DEBUGMACROS("[MACRO] %s body\r\n", f.name.c_str());
                     fireRule(f, r);
                 }
                 continue;
@@ -1583,7 +1623,6 @@ void CLASS_MODULE_MACROS::tickStep() {
                     bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
                     if (errTxt.length() > 0) { f.err = errTxt; }
                     if (ok) {
-                        DEBUGMACROS("[MACRO] %s cron(%s)\r\n", f.name.c_str(), r.spec.c_str());
                         fireRule(f, r);
                     }
                     // Продвигаем next всегда — защита от цикла при устойчивой ошибке cond.
@@ -1600,7 +1639,6 @@ void CLASS_MODULE_MACROS::tickStep() {
                     continue;   // fire не вызывается, lastCond не меняем
                 }
                 if (truth && r.lastCond == false) {
-                    DEBUGMACROS("[MACRO] %s cond(true)\r\n", f.name.c_str());
                     r.lastCond = true;
                     fireRule(f, r);
                 } else if (truth == false) {

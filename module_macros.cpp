@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <new>
+#include <memory>
 
 CLASS_MODULE_MACROS module_macros;
 
@@ -32,6 +33,7 @@ CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _luaHeapBytes = 0;
     _nEvtSubs = 0;
     _resourcesReady = false;
+    _resourcesMs = 0;
 }
 
 // Периодическая 1-сек задача и терминальный обработчик объявлены здесь,
@@ -260,12 +262,16 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
         return;
     }
 
-    AsyncResponseStream *resp = request->beginResponseStream("application/json");
-    resp->print("{\"enabled\":");
-    resp->print(_config.enabled ? "true" : "false");
-    resp->print(",\"ntp\":");
-    resp->print((NTP.getLastNTPSync() > 0) ? "1" : "0");
-    resp->print(",\"files\":[");
+    // Ответ собирается в String и отдаётся одной копией через send(): стриминговый
+    // AsyncResponseStream на больших ответах не досылал байты (Content-Length > body),
+    // из-за чего клиент зависал в ожидании хвоста.
+    String out;
+    out.reserve(2048);
+    out += "{\"enabled\":";
+    out += (_config.enabled ? "true" : "false");
+    out += ",\"ntp\":";
+    out += ((NTP.getLastNTPSync() > 0) ? "1" : "0");
+    out += ",\"files\":[";
 
     // Сортировка по приоритету (0 - высший), затем по имени
     uint8_t order[MACRO_MAX_FILES];
@@ -286,31 +292,31 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
 
     for (uint8_t n = 0; n < _fileCount; n++) {
         MacroFile& f = _files[order[n]];
-        if (n > 0) { resp->print(","); }
+        if (n > 0) { out += ","; }
 
-        resp->print("{\"name\":\"");
-        resp->print(escapeJson(ns_module_macros::macroFileBaseName(f.name)));
-        resp->print("\",\"prio\":");
-        resp->print(f.prio);
-        resp->print(",\"run\":");
-        resp->print(f.run ? "true" : "false");
-        resp->print(",\"size\":");
-        resp->print(f.size);
-        resp->print(",\"created\":");
-        resp->print(f.created);
-        resp->print(",\"active\":");
-        resp->print(f.active ? "true" : "false");
-        resp->print(",\"cron\":\"");
-        resp->print(escapeJson(f.metaCron));
-        resp->print("\",\"desc\":\"");
-        resp->print(escapeJson(f.desc));
-        resp->print("\",\"err\":\"");
-        resp->print(escapeJson(f.err));
-        resp->print("\"}");
+        out += "{\"name\":\"";
+        out += escapeJson(ns_module_macros::macroFileBaseName(f.name));
+        out += "\",\"prio\":";
+        out += String((unsigned int)f.prio);
+        out += ",\"run\":";
+        out += (f.run ? "true" : "false");
+        out += ",\"size\":";
+        out += String((unsigned long)f.size);
+        out += ",\"created\":";
+        out += String((unsigned long)f.created);
+        out += ",\"active\":";
+        out += (f.active ? "true" : "false");
+        out += ",\"cron\":\"";
+        out += escapeJson(f.metaCron);
+        out += "\",\"desc\":\"";
+        out += escapeJson(f.desc);
+        out += "\",\"err\":\"";
+        out += escapeJson(f.err);
+        out += "\"}";
     }
 
-    resp->print("]}");
-    request->send(resp);
+    out += "]}";
+    request->send(200, "application/json", out);
 }
 
 void CLASS_MODULE_MACROS::handleCreate(AsyncWebServerRequest *request) {
@@ -505,24 +511,31 @@ void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
 // Список модулей (namespace) с режимами — страница управления модулями (state.html).
 // Перенесено из core_state; данные берутся через core_state.modulesInfo().
 void CLASS_MODULE_MACROS::handleModules(AsyncWebServerRequest *request) {
+    // JsonDocument + сериализация в String — под защитой heap (модулей может быть много).
+    if (ESP.getMaxAllocHeap() < 6000) {
+        request->send(503, "text/plain", "ERR: low memory");
+        return;
+    }
     BusModuleInfo mods[CORE_STATE_MAX_NS];
     uint8_t n = core_state.modulesInfo(mods, CORE_STATE_MAX_NS);
 
-    JsonDocument doc;
-    doc["macros_available"] = 1;   // страница существует только в сборке с macros
-    JsonArray arr = doc["modules"].to<JsonArray>();
-    for (uint8_t i = 0; i < n; i++) {
-        JsonObject o = arr.add<JsonObject>();
-        o["ns"] = mods[i].name;
-        o["privileged"] = mods[i].privileged ? 1 : 0;
-        o["prio"] = mods[i].prio;
-        o["has_mode"] = (mods[i].mode >= 0) ? 1 : 0;
-        o["mode"] = mods[i].mode;
-        o["desc"] = (mods[i].desc != nullptr) ? mods[i].desc : "";
-    }
-
     String out;
-    serializeJson(doc, out);
+    {
+        JsonDocument doc;
+        doc["macros_available"] = 1;   // страница существует только в сборке с macros
+        JsonArray arr = doc["modules"].to<JsonArray>();
+        for (uint8_t i = 0; i < n; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["ns"] = mods[i].name;
+            o["privileged"] = mods[i].privileged ? 1 : 0;
+            o["prio"] = mods[i].prio;
+            o["has_mode"] = (mods[i].mode >= 0) ? 1 : 0;
+            o["mode"] = mods[i].mode;
+            o["desc"] = (mods[i].desc != nullptr) ? mods[i].desc : "";
+        }
+
+        serializeJson(doc, out);
+    }
     request->send(200, "application/json", out);
 }
 
@@ -541,45 +554,74 @@ void CLASS_MODULE_MACROS::handleModuleMode(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
-    // Каталог содержит текущие значения ENUM-ресурсов, поэтому пересобираем его
-    // на каждый запрос. Последняя удачная строка остаётся как fallback при
-    // нехватке heap/overflow и стримится без повторной сборки.
-    // Сборка требует JsonDocument + временную String + копию в _resourcesJson,
-    // поэтому порог зависит от размера каталога (с минимумом 8000 на первый сбор).
-    size_t need = _resourcesJson.length() + 4096;
-    if (need < 8000) { need = 8000; }
-    if (ESP.getMaxAllocHeap() < need) {
-        if (_resourcesReady && _resourcesJson.length() > 0) {
-            AsyncResponseStream *resp = request->beginResponseStream("application/json");
-            resp->print(_resourcesJson);
-            request->send(resp);
+    // Каталог отдаём напрямую через send() (стриминговый AsyncResponseStream на
+    // большом ответе не досылал байты → клиент зависал, зависшие соединения
+    // добивали heap).
+    // Сборка каталога — тяжёлая (JsonDocument); при параллельных запросах это
+    // переполняло heap и давало abort() в operator new. Поэтому каталог кэшируем
+    // (TTL MACRO_RES_CACHE_MS) и пересобираем не чаще одного раза за TTL.
+    bool rebuild = (!_resourcesReady) ||
+                   ((uint32_t)(millis() - _resourcesMs) >= MACRO_RES_CACHE_MS);
+
+    if (rebuild) {
+        // На сборку нужен запас: JsonDocument + строка каталога.
+        size_t need = _resourcesJson.length() + 4096;
+        if (need < 8000) { need = 8000; }
+        if (ESP.getMaxAllocHeap() < need) {
+            if (_resourcesReady && _resourcesJson.length() > 0) {
+                request->send(200, "application/json", _resourcesJson);
+                return;
+            }
+            request->send(503, "text/plain", "ERR: low memory");
             return;
         }
+
+        // JsonDocument в отдельном блоке: освобождается до копирования ответа.
+        bool built = false;
+        {
+            JsonDocument doc;
+            core_state.catalogToJson(doc);
+            if (!doc.overflowed()) {
+                _resourcesJson = "";
+                serializeJson(doc, _resourcesJson);
+                _resourcesReady = true;
+                _resourcesMs = millis();
+                built = true;
+            }
+        }
+        if (!built) {
+            if (_resourcesReady && _resourcesJson.length() > 0) {
+                request->send(200, "application/json", _resourcesJson);
+                return;
+            }
+            request->send(500, "text/plain", "ERR: catalog too large");
+            return;
+        }
+    }
+
+    // Перед ответом проверяем запас под снимок каталога.
+    if (ESP.getMaxAllocHeap() < _resourcesJson.length() + 1024) {
+        request->send(503, "text/plain", "ERR: busy");
+        return;
+    }
+
+    // Большой каталог отдаём chunked-ответом: AsyncBasicResponse (send с готовой
+    // строкой) на теле больше TCP-send-буфера падает в String::move (null deref),
+    // а AsyncResponseStream не досылал хвост. Chunked-путь безопасен для любого размера.
+    auto payload = std::make_shared<String>(_resourcesJson);
+    if (!payload || payload->length() == 0) {
         request->send(503, "text/plain", "ERR: low memory");
         return;
     }
-
-    JsonDocument doc;
-    core_state.catalogToJson(doc);
-    if (doc.overflowed()) {
-        if (_resourcesReady && _resourcesJson.length() > 0) {
-            AsyncResponseStream *resp = request->beginResponseStream("application/json");
-            resp->print(_resourcesJson);
-            request->send(resp);
-            return;
-        }
-        request->send(500, "text/plain", "ERR: catalog too large");
-        return;
-    }
-
-    String out;
-    serializeJson(doc, out);
-    _resourcesJson = out;
-    _resourcesReady = true;
-
-    AsyncResponseStream *resp = request->beginResponseStream("application/json");
-    resp->print(_resourcesJson);
-    request->send(resp);
+    request->sendChunked("application/json",
+        [payload](uint8_t* data, size_t len, size_t index) -> size_t {
+            const String& s = *payload;
+            if (index >= s.length()) { return 0; }
+            size_t n = s.length() - index;
+            if (n > len) { n = len; }
+            memcpy(data, s.c_str() + index, n);
+            return n;
+        });
 }
 
 void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {

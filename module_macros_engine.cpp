@@ -104,6 +104,16 @@ static void macroPushSandbox(lua_State* L) {
     lua_setmetatable(L, -2);
 }
 
+// Обёртка для ПРОТЕКТИРОВАННОЙ установки песочницы: вызывается под lua_pcall,
+// чтобы аллокации таблиц не улетали вне защиты (иначе память → abort()).
+// Аргумент 1 — чанк; возвращает тот же чанк с подставленным _ENV.
+static int macroChunkSetup(lua_State* L) {
+    macroPushSandbox(L);
+    lua_setupvalue(L, 1, 1);      // chunk._ENV = env
+    lua_pushvalue(L, 1);          // вернуть чанк
+    return 1;
+}
+
 // Загружает content как чанк с песочницей и исполняет; при успехе
 // на стеке остаётся одно возвращённое значение (таблица).
 static int macroLoadChunk(lua_State* L, MacroFile& f, const String& content) {
@@ -117,9 +127,13 @@ static int macroLoadChunk(lua_State* L, MacroFile& f, const String& content) {
 
     int status = luaL_loadbuffer(L, content.c_str(), content.length(), cn.c_str());
     if (status == LUA_OK) {
-        macroPushSandbox(L);
-        lua_setupvalue(L, -2, 1);   // _ENV = env
-        status = lua_pcall(L, 0, 1, 0);
+        // Песочница ставится в защищённом вызове (аллокации таблиц вне pcall → abort).
+        lua_pushcfunction(L, macroChunkSetup);
+        lua_insert(L, -2);                 // [setup, chunk]
+        status = lua_pcall(L, 1, 1, 0);    // -> [chunk]
+    }
+    if (status == LUA_OK) {
+        status = lua_pcall(L, 0, 1, 0);    // исполняем чанк -> [result]
     }
     lua_sethook(L, NULL, 0, 0);
 
@@ -958,6 +972,12 @@ bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
         if (f.parseFails < MACRO_PARSE_MAX_RETRY) { f.needParse = true; }
         return false;
     }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) {
+        f.err = "low memory";
+        f.parseFails++;
+        if (f.parseFails < MACRO_PARSE_MAX_RETRY) { f.needParse = true; }
+        return false;
+    }
 
     lua_State* L = _lua->getLuaState();
     int status = macroLoadChunk(L, f, content);
@@ -1182,6 +1202,7 @@ void CLASS_MODULE_MACROS::refreshFileMeta(MacroFile& f) {
     if (f.active) { return; }                 // активный уже заполнен registerFile
     if (_fs == NULL || _fs->exists(f.name) == false) { return; }
     if (initLua() == false) { return; }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { return; }
 
     String content = readFile(f.name);
     if (content.length() == 0) { return; }
@@ -1249,9 +1270,19 @@ static void macroPushEventTable(lua_State* L, MacroRule& r, const BusValue* valu
     lua_setfield(L, -2, "args");
 }
 
+// Обёртка для ПРОТЕКТИРОВАННОГО построения таблицы события: вызывается под
+// lua_pcall (аллокации tabla вне защиты → abort()). Правило передаётся upvalue.
+static int macroPushEventClosure(lua_State* L) {
+    MacroRule* r = (MacroRule*)lua_touserdata(L, lua_upvalueindex(1));
+    if (r == NULL) { lua_pushnil(L); return 1; }
+    macroPushEventTable(L, *r, nullptr);
+    return 1;
+}
+
 /** Исполняет named-handler: перечитывает файл, компилирует и вызывает функция. */
 String CLASS_MODULE_MACROS::runHandler(MacroFile& f, MacroRule& r) {
     if (_lua == NULL) { return "No interpreter"; }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { return "low memory"; }
 
     String content = readFile(f.name);
     if (content.length() == 0) { return "File is empty or unreadable"; }
@@ -1270,7 +1301,15 @@ String CLASS_MODULE_MACROS::runHandler(MacroFile& f, MacroRule& r) {
     lua_getfield(L, -1, r.handler.c_str());
     if (!lua_isfunction(L, -1)) { lua_settop(L, 0); return String("handler not found: ") + r.handler; }
 
-    macroPushEventTable(L, r, NULL);
+    // Таблицу события строим в защищённом вызове (стек: [handler] -> [handler, event]).
+    lua_pushlightuserdata(L, &r);
+    lua_pushcclosure(L, macroPushEventClosure, 1);
+    status = lua_pcall(L, 0, 1, 0);
+    if (status != LUA_OK) {
+        String err = macroLuaPopError(L);
+        lua_settop(L, 0);
+        return (err.length() > 0) ? err : String("event table error");
+    }
 
     macroLuaSteps = 0;
     lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);

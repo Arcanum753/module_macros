@@ -162,7 +162,7 @@ spiffs 1336 КБ. Остальные env используют `partitions_esp32.
 | `/macros/prio?name=&dir=+1|-1` | изменить приоритет |
 | `/macros/reload?name=` | перечитать (без name — все) |
 | `/macros/fire?type=&token=` | внешнее событие (резерв) |
-| `/macros/resources` | каталог ресурсов шины (JSON; для ENUM — поля `value`/`valueName`; пересобирается на каждый запрос) |
+| `/macros/resources` | каталог ресурсов шины (JSON; для ENUM — поля `value`/`valueName`; кэш с TTL `MACRO_RES_CACHE_MS`, отдаётся chunked-ответом) |
 | `/macros/validate?cron=&body=` | валидация cron, синтаксиса Lua и `rules`/`meta_cron` (включая ENUM-имена) |
 | `/macros/get?name=` | чтение содержимого сценария |
 | `/macros/save?name=&body=` | запись содержимого сценария |
@@ -491,7 +491,7 @@ web (/macros.html) ──GET──▶ web_Init-эндпоинты  → толь�
 - `MacroCond` — одно условие: `res` (`ns.field`), `op` (`MACRO_COND_*`), `val` (целевое значение).
 - `MacroEvent` — элемент очереди внешних событий (term/button/on).
 - `strMacrosConfig` — `enabled`.
-- Ограничения (ESP32): до 30 файлов, до 8 правил в файле, до `MACRO_MAX_CONDS = 4` условий
+- Ограничения (ESP32): до 40 файлов, до 8 правил в файле, до `MACRO_MAX_CONDS = 4` условий
   `cond` в правиле, до 4 bus-вызовов в правиле, до 4 аргументов в вызове. Бюджет heap модуля —
   100 КБ (проверка `/macros/heap`).
 
@@ -593,7 +593,7 @@ flash. В сценариях доступен только язык Lua + фун
 - FR-MACROS-7: Lua bus API: `get`, `set`, `call`, `has`, `mode`, `info`, `puts`/`print`, `clock`, `now`; `call_async` из Lua запрещён.
 - FR-MACROS-8: Handler получает таблицу `event` (`type`, `spec`, `args`, `value`); глобалы между вызовами не живут.
 - FR-MACROS-9: Конфиг `/config_macros.json`: `enabled` (bool), `files[]` (`name`, `prio` 0..7, `run`, `created`).
-- FR-MACROS-10: Лимиты: `MACRO_MAX_FILES=30`, `MACRO_MAX_RULES=8`, `MACRO_EV_QUEUE=8`, `MACRO_MAX_EVENT_SUBS=8`, `MACRO_HEAP_BUDGET=100 КБ`, `MACRO_HEAP_CRIT_PCT=95%`, `MACRO_LUA_MAX_OPS=100000`, `MACRO_PARSE_PER_TICK=2`, `MACRO_PARSE_MAX_RETRY=3`.
+- FR-MACROS-10: Лимиты: `MACRO_MAX_FILES=40`, `MACRO_MAX_RULES=8`, `MACRO_EV_QUEUE=8`, `MACRO_MAX_EVENT_SUBS=8`, `MACRO_HEAP_BUDGET=100 КБ`, `MACRO_HEAP_CRIT_PCT=95%`, `MACRO_LUA_MAX_OPS=100000`, `MACRO_PARSE_PER_TICK=2`, `MACRO_PARSE_MAX_RETRY=3`, `MACRO_LUA_MIN_HEAP=24 КБ`, `MACRO_RES_CACHE_MS=1000`.
 - FR-MACROS-11: Ресурсы bus: `macros.enabled` (BOOL), `macros.files` (I32); функция `macros.reload`; namespace `macros` привилегированный.
 - FR-MACROS-12: Редактирование/сохранение сценария разрешено только для остановленного файла.
 - FR-MACROS-13: Защита от OOM в `/macros/list` (порог 6000 Б) и `/macros/resources` (8000 Б), страховка `doc.overflowed()`.

@@ -407,17 +407,32 @@
             hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft;
         }
 
-        // ---- Дерево ресурсов ----
+        // ---- Дерево ресурсов (двухэтапно) ----
+        // 1) список ресурсов — из статического /macros/resources.json (генерируется при сборке FS);
+        //    фолбэк — рантайм /macros/resources, если файла нет.
+        // 2) значения/детали ресурса — по клику через лёгкий /state/info.
         async function loadResources(force) {
             if (RESOURCES_READY && !force) { return; }
-            const data = await (await fetch('/macros/resources', { cache: 'no-store' })).json();
+            const tree = document.getElementById('resTree');
+            let data = null;
+            try {
+                const rs = await fetch('/macros/resources.json', { cache: 'no-store' });
+                if (rs.ok) { data = await rs.json(); }
+            } catch (e) { /* нет файла — упадём на рантайм */ }
+            if (!data) {
+                try { data = await (await fetch('/macros/resources', { cache: 'no-store' })).json(); }
+                catch (e) { data = null; }
+            }
+            if (!data) {
+                tree.innerHTML = '<span style="color:#c00;font-size:12px;">каталог ресурсов недоступен</span>';
+                return;
+            }
             RESOURCES_READY = true;
             const feat = data.features || {};
             EDITOR_AVAILABLE = (feat.editor === 1);
             document.getElementById('btnEdit').style.display = EDITOR_AVAILABLE ? '' : 'none';
             const btnAce = document.getElementById('btnOpenAce');
             if (btnAce) { btnAce.style.display = EDITOR_AVAILABLE ? '' : 'none'; }
-            const tree = document.getElementById('resTree');
             tree.innerHTML = '';
             const groups = {};
             for (const r of (data.resources || [])) {
@@ -434,32 +449,48 @@
                     const el = document.createElement('div');
                     el.className = 'res';
                     const flags = (r.rw ? 'rw ' : '') + (r.e ? 'e ' : '') + (r.a ? 'a ' : '');
-                    let label = '• ' + r.name + ' [' + r.kind + '] ' + flags;
-                    if (r.kind === 'ENUM' && r.valueName) { label += '= ' + r.valueName; }
-                    el.innerText = label;
-                    el.onclick = () => showProps(r);
+                    el.innerText = '• ' + r.name + ' [' + r.kind + '] ' + flags;
+                    el.onclick = () => showProps(r, el);
                     el.ondblclick = () => insertSnippet(r);
                     tree.appendChild(el);
                 });
             });
         }
-        function showProps(r) {
+        function infoValue(txt) {
+            for (const line of (txt || '').split('\n')) {
+                const p = line.split('|');
+                if (p[0] === 'value') { return p[1] !== undefined ? p[1] : ''; }
+            }
+            return null;
+        }
+        async function showProps(r, el) {
+            const panel = document.getElementById('propPanel');
             let h = '<b>' + esc(r.full) + '</b><br>' + esc(r.desc || '');
             h += '<br>kind: ' + r.kind + ' | ro: ' + !r.rw + ' | func: ' + !!r.f + ' | async: ' + !!r.a + ' | event: ' + !!r.e;
-            if (r.kind === 'ENUM') {
-                if (r.valueName) {
-                    const idx = (typeof r.value === 'number') ? ' (' + r.value + ')' : '';
-                    h += '<br>current: <b>' + esc(r.valueName) + '</b>' + idx;
-                } else if (typeof r.value === 'number') {
-                    h += '<br>current: ' + r.value;
+            if (r.enum && r.enum.length) {
+                h += '<br>enum: ' + r.enum.map(v => esc(v)).join(', ');
+            }
+            panel.innerHTML = h + '<br><i>reading…</i>';
+            try {
+                const txt = await (await fetch('/state/info?name=' + encodeURIComponent(r.full), { cache: 'no-store' })).text();
+                let val = infoValue(txt);
+                if (val === null) {
+                    panel.innerHTML = h + '<br>current: <i>n/a</i>';
+                    return;
                 }
+                if (r.kind === 'ENUM') {
+                    const idx = parseInt(val, 10);
+                    if (!isNaN(idx) && r.enum && r.enum[idx] !== undefined) {
+                        r.value = idx; r.valueName = r.enum[idx]; val = r.enum[idx];
+                    }
+                }
+                if (el && r.kind === 'ENUM' && r.valueName) {
+                    el.innerText = el.innerText.replace(/=.*$/, '') + '= ' + r.valueName;
+                }
+                panel.innerHTML = h + '<br>current: <b>' + esc(val) + '</b>';
+            } catch (e) {
+                panel.innerHTML = h + '<br>current: <i>n/a</i>';
             }
-            if (r.enum) {
-                h += '<br>enum: ' + r.enum.map(v =>
-                    (r.valueName && v === r.valueName) ? '<b>' + esc(v) + '</b>' : esc(v)).join(', ');
-            }
-            if (r.codes) { r.codes.forEach(c => { h += '<br>code ' + c.code + ': ' + esc(c.meaning); }); }
-            document.getElementById('propPanel').innerHTML = h;
         }
         function insertSnippet(r) {
             if (CUR_EDIT_RUN) { return; }   // запущенный сценарий — только просмотр

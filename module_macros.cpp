@@ -34,6 +34,7 @@ CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _nEvtSubs = 0;
     _resourcesReady = false;
     _resourcesMs = 0;
+    _lock = NULL;
 }
 
 // Периодическая 1-сек задача и терминальный обработчик объявлены здесь,
@@ -49,19 +50,17 @@ static void resetMacroFile(MacroFile& f) {
     f.prio = 7;
     f.run = false;
     f.created = 0;
-    f.metaCron = "";
     f.size = 0;
     f.active = false;
     f.err = "";
     f.desc = "";
     f.needParse = false;
     f.parseFails = 0;
-    f.rules = NULL;
-    f.nRules = 0;
-    memset(&f.metaExpr, 0, sizeof(cron_expr));
-    f.metaValid = false;
-    f.metaInit = false;
-    f.metaNext = 0;
+    f.chunkRef = LUA_NOREF;
+    f.envRef = LUA_NOREF;
+    f.stateRef = LUA_NOREF;
+    f.handlers = NULL;
+    f.nHandlers = 0;
 }
 
 // Обновляет кэш размера файла (чтобы /macros/list не открывал файлы на каждый запрос).
@@ -73,6 +72,29 @@ static void updateMacroFileSize(fs::LittleFSFS* fs, MacroFile& f) {
         f.size = (uint32_t)sf.size();
         sf.close();
     }
+}
+
+// Отдаёт потенциально большой текст chunked-ответом. AsyncBasicResponse (send с
+// готовой строкой) на теле больше TCP-send-буфера падает в String::move (null
+// deref), когда копия тела не помещается в кучу; chunked-путь не делает копию.
+static void sendStringChunked(AsyncWebServerRequest* request, const char* type, const String& body) {
+    if (body.length() == 0) {
+        request->send(200, type, "");
+        return;
+    }
+    auto payload = std::make_shared<String>(body);
+    if (!payload || payload->length() == 0) {
+        request->send(503, "text/plain", "ERR: low memory");
+        return;
+    }
+    request->sendChunked(type, [payload](uint8_t* data, size_t len, size_t index) -> size_t {
+        const String& s = *payload;
+        if (index >= s.length()) { return 0; }
+        size_t n = s.length() - index;
+        if (n > len) { n = len; }
+        memcpy(data, s.c_str() + index, n);
+        return n;
+    });
 }
 
 // ============================================================
@@ -87,6 +109,9 @@ void CLASS_MODULE_MACROS::setFs(fs::LittleFSFS* fs) {
 // ============================================================
 void CLASS_MODULE_MACROS::begin() {
     DEBUGMACROS("%s\r\n", __FUNCTION__);
+
+    // Мьютекс runtime: тик (loop) vs веб-обработчики (AsyncTCP).
+    if (_lock == NULL) { _lock = xSemaphoreCreateRecursiveMutex(); }
 
     // Массив файлов выделяется в heap (static .bss для 25 слотов не влезает в DRAM).
     if (_files == NULL) {
@@ -103,6 +128,27 @@ void CLASS_MODULE_MACROS::begin() {
     ensureMacrosDir();
     reconcileList();
 
+    // Лимит запущенных: если в конфиге больше MACRO_MAX_RUNNING — оставляем первые
+    // (по порядку списка), остальные переводим в стоп и сохраняем.
+    {
+        uint8_t runN = 0;
+        bool changed = false;
+        for (uint8_t i = 0; i < _fileCount; i++) {
+            if (_files[i].run == false) { continue; }
+            runN++;
+            if (runN > MACRO_MAX_RUNNING) {
+                _files[i].run = false;
+                _files[i].needParse = false;
+                changed = true;
+            }
+        }
+        if (changed) {
+            DEBUGMACROS("%s: run limit %d exceeded, extra files stopped\r\n",
+                        __FUNCTION__, MACRO_MAX_RUNNING);
+            saveConfig();
+        }
+    }
+
     // Кэшируем размеры файлов один раз при старте (для /macros/list).
     for (uint8_t i = 0; i < _fileCount; i++) { updateMacroFileSize(_fs, _files[i]); }
 
@@ -115,8 +161,8 @@ void CLASS_MODULE_MACROS::begin() {
     markAllDirty();
     while (anyNeedParse()) { rebuildScripts(); }
 
-    // Заполняем desc/meta_cron и для остановленных сценариев: страница должна
-    // показывать окно и описание файла без его запуска.
+    // Заполняем desc и для остановленных сценариев: страница должна
+    // показывать описание файла без его запуска.
     for (uint8_t i = 0; i < _fileCount; i++) {
         if (_files[i].active == false) { refreshFileMeta(_files[i]); }
     }
@@ -256,6 +302,7 @@ void CLASS_MODULE_MACROS::web_Init() {
 // Веб-обработчики
 // ============================================================
 void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     // Защита от OOM в AsyncTCP: без запаса heap не строим ответ.
     if (ESP.getMaxAllocHeap() < 6000) {
         request->send(503, "text/plain", "ERR: low memory");
@@ -306,9 +353,9 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
         out += String((unsigned long)f.created);
         out += ",\"active\":";
         out += (f.active ? "true" : "false");
-        out += ",\"cron\":\"";
-        out += escapeJson(f.metaCron);
-        out += "\",\"desc\":\"";
+        out += ",\"handlers\":";
+        out += String((unsigned int)f.nHandlers);
+        out += ",\"desc\":\"";
         out += escapeJson(f.desc);
         out += "\",\"err\":\"";
         out += escapeJson(f.err);
@@ -316,10 +363,11 @@ void CLASS_MODULE_MACROS::handleList(AsyncWebServerRequest *request) {
     }
 
     out += "]}";
-    request->send(200, "application/json", out);
+    sendStringChunked(request, "application/json", out);
 }
 
 void CLASS_MODULE_MACROS::handleCreate(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     String tmpl = MACRO_DEFAULT_NAME;
@@ -342,6 +390,7 @@ void CLASS_MODULE_MACROS::handleCreate(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleDelete(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("name")) { request->send(200, "text/plain", "ERR: no name"); return; }
@@ -363,6 +412,7 @@ void CLASS_MODULE_MACROS::handleDelete(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleRename(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("old") || !request->hasArg("new")) {
@@ -383,6 +433,7 @@ void CLASS_MODULE_MACROS::handleRename(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleState(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("name") || !request->hasArg("on")) {
@@ -396,11 +447,18 @@ void CLASS_MODULE_MACROS::handleState(AsyncWebServerRequest *request) {
     if (setFileRun(base, on)) {
         request->send(200, "text/plain", "OK");
     } else {
-        request->send(200, "text/plain", "ERR: not found");
+        int idx = findFile(MACROS_DIR_RE + base);
+        if (on && idx >= 0 && !_files[idx].run && runningCount() >= MACRO_MAX_RUNNING) {
+            request->send(200, "text/plain",
+                          String("ERR: run limit ") + MACRO_MAX_RUNNING);
+        } else {
+            request->send(200, "text/plain", "ERR: not found");
+        }
     }
 }
 
 void CLASS_MODULE_MACROS::handlePrio(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("name") || !request->hasArg("dir")) {
@@ -419,6 +477,7 @@ void CLASS_MODULE_MACROS::handlePrio(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleReload(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (request->hasArg("name")) {
@@ -440,17 +499,18 @@ void CLASS_MODULE_MACROS::handleReload(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleFire(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("token")) {
         request->send(200, "text/plain", "ERR: no token");
         return;
     }
-    uint8_t type = MACRO_RULE_TERM;
+    uint8_t type = MACRO_H_TERM;
     if (request->hasArg("type")) {
         String t = request->arg("type");
-        if (t == "button") { type = MACRO_RULE_BUTTON; }
-        else if (t == "term") { type = MACRO_RULE_TERM; }
+        if (t == "button") { type = MACRO_H_BUTTON; }
+        else if (t == "term") { type = MACRO_H_TERM; }
     }
     String token = request->arg("token");
     if (fireToken(type, token)) {
@@ -461,6 +521,7 @@ void CLASS_MODULE_MACROS::handleFire(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (!request->hasArg("name") || !request->hasArg("body")) {
@@ -495,6 +556,7 @@ void CLASS_MODULE_MACROS::handleWrite(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleGet(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     if (!request->hasArg("name")) {
         request->send(200, "text/plain", "");
         return;
@@ -536,7 +598,7 @@ void CLASS_MODULE_MACROS::handleModules(AsyncWebServerRequest *request) {
 
         serializeJson(doc, out);
     }
-    request->send(200, "application/json", out);
+    sendStringChunked(request, "application/json", out);
 }
 
 // Смена режима модуля: off/auto/macro. Перенесено из core_state.
@@ -554,6 +616,7 @@ void CLASS_MODULE_MACROS::handleModuleMode(AsyncWebServerRequest *request) {
 }
 
 void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     // Каталог отдаём напрямую через send() (стриминговый AsyncResponseStream на
     // большом ответе не досылал байты → клиент зависал, зависшие соединения
     // добивали heap).
@@ -569,7 +632,7 @@ void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
         if (need < 8000) { need = 8000; }
         if (ESP.getMaxAllocHeap() < need) {
             if (_resourcesReady && _resourcesJson.length() > 0) {
-                request->send(200, "application/json", _resourcesJson);
+                sendStringChunked(request, "application/json", _resourcesJson);
                 return;
             }
             request->send(503, "text/plain", "ERR: low memory");
@@ -591,7 +654,7 @@ void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
         }
         if (!built) {
             if (_resourcesReady && _resourcesJson.length() > 0) {
-                request->send(200, "application/json", _resourcesJson);
+                sendStringChunked(request, "application/json", _resourcesJson);
                 return;
             }
             request->send(500, "text/plain", "ERR: catalog too large");
@@ -605,26 +668,12 @@ void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Большой каталог отдаём chunked-ответом: AsyncBasicResponse (send с готовой
-    // строкой) на теле больше TCP-send-буфера падает в String::move (null deref),
-    // а AsyncResponseStream не досылал хвост. Chunked-путь безопасен для любого размера.
-    auto payload = std::make_shared<String>(_resourcesJson);
-    if (!payload || payload->length() == 0) {
-        request->send(503, "text/plain", "ERR: low memory");
-        return;
-    }
-    request->sendChunked("application/json",
-        [payload](uint8_t* data, size_t len, size_t index) -> size_t {
-            const String& s = *payload;
-            if (index >= s.length()) { return 0; }
-            size_t n = s.length() - index;
-            if (n > len) { n = len; }
-            memcpy(data, s.c_str() + index, n);
-            return n;
-        });
+    // Большой каталог отдаём chunked-ответом (без копии тела в AsyncBasicResponse).
+    sendStringChunked(request, "application/json", _resourcesJson);
 }
 
 void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
     if (request->hasArg("cron")) {
@@ -637,26 +686,16 @@ void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
 
     if (request->hasArg("body")) {
         String body = request->arg("body");
+        // Валидация на ИЗОЛИРОВАННОМ интерпретаторе: веб-задача (AsyncTCP) не должна
+        // трогать общий _lua, который параллельно исполняет тик в loop-задаче.
         EspLuaEngine eng;
-        if (eng.getLuaState() == NULL) {
+        if (eng.getLuaState() == NULL || macroRegisterHelpers(eng) == false) {
             request->send(200, "text/plain", "ERROR: no memory");
             return;
         }
-        String cn = "@validate";
-        int status = luaL_loadbuffer(eng.getLuaState(), body.c_str(), body.length(), cn.c_str());
-        if (status != LUA_OK) {
-            size_t len = 0;
-            const char* s = lua_tolstring(eng.getLuaState(), -1, &len);
-            String e = (s != NULL) ? String(s) : String("syntax error");
-            request->send(200, "text/plain", String("ERROR: lua: ") + e);
-            return;
-        }
-        lua_pop(eng.getLuaState(), 1);
-
-        // Семантическая валидация rules/meta_cron (ENUM-имена, cron-ошибки).
         String rerr;
-        if (macroValidateScenario(eng, body, rerr) == false) {
-            request->send(200, "text/plain", String("ERROR: rules: ") + rerr);
+        if (macroValidateScript(eng, body, rerr) == false) {
+            request->send(200, "text/plain", String("ERROR: ") + rerr);
             return;
         }
     }
@@ -664,8 +703,9 @@ void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "OK");
 }
 
-// Оценка heap, занятого модулем: массив файлов + правила (со строками) +
-// единый lua_State + кэш каталога ресурсов. Служит для проверки бюджета.
+// Оценка heap, занятого модулем: массив файлов + runtime активных файлов
+// (chunk/env/state refs + массив обработчиков) + единый lua_State + кэш
+// каталога. Служит для проверки бюджета (/macros/heap).
 size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
     size_t total = 0;
 
@@ -674,25 +714,12 @@ size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
         for (uint8_t i = 0; i < _fileCount; i++) {
             MacroFile& f = _files[i];
             total += f.name.length() + 1;
-            total += f.metaCron.length() + 1;
             total += f.desc.length() + 1;
             total += f.err.length() + 1;
-            if (f.rules == NULL) { continue; }
-            total += sizeof(MacroRule) * f.nRules;
-            for (uint8_t j = 0; j < f.nRules; j++) {
-                MacroRule& r = f.rules[j];
-                total += r.spec.length() + 1;
-                total += r.setTarget.length() + 1;
-                if (r.setValue.kind == BusValue::STR) { total += r.setValue.s.length() + 1; }
-                for (uint8_t k = 0; k < r.nConds; k++) {
-                    total += r.conds[k].res.length() + 1;
-                    if (r.conds[k].val.kind == BusValue::STR) { total += r.conds[k].val.s.length() + 1; }
-                    total += r.lastVals[k].length() + 1;
-                }
-                total += r.handler.length() + 1;
-                total += r.handlerArgs.length() + 1;
-                for (uint8_t a = 0; a < r.nActions; a++) {
-                    total += r.actions[a].length() + 1;
+            if (f.handlers != NULL) {
+                total += sizeof(MacroHandler) * MACRO_MAX_HANDLERS;
+                for (uint8_t h = 0; h < f.nHandlers; h++) {
+                    total += f.handlers[h].key.length() + 1;
                 }
             }
         }
@@ -705,13 +732,14 @@ size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
 }
 
 void CLASS_MODULE_MACROS::handleHeap(AsyncWebServerRequest *request) {
+    MacroLockGuard lk(_lock);
     size_t used = estimateHeapBytes();
     uint32_t pct = (uint32_t)((used * 100) / MACRO_HEAP_BUDGET);
     bool critical = (pct >= MACRO_HEAP_CRIT_PCT);
     uint8_t active = 0;
-    uint16_t rules = 0;
+    uint16_t handlers = 0;
     for (uint8_t i = 0; i < _fileCount; i++) {
-        if (_files[i].active) { active++; rules += _files[i].nRules; }
+        if (_files[i].active) { active++; handlers += _files[i].nHandlers; }
     }
 
     AsyncResponseStream *resp = request->beginResponseStream("application/json");
@@ -724,7 +752,7 @@ void CLASS_MODULE_MACROS::handleHeap(AsyncWebServerRequest *request) {
     resp->print(",\"critical\":"); resp->print(critical ? "true" : "false");
     resp->print(",\"files\":");    resp->print(_fileCount);
     resp->print(",\"active\":");   resp->print(active);
-    resp->print(",\"rules\":");    resp->print(rules);
+    resp->print(",\"rules\":");    resp->print(handlers);
     resp->print(",\"lua\":");      resp->print((uint32_t)_luaHeapBytes);
     resp->print(",\"catalog\":");  resp->print((uint32_t)_resourcesJson.length());
     resp->print("}");
@@ -815,6 +843,15 @@ int CLASS_MODULE_MACROS::findFile(const String& name) {
         if (_files[i].name == name) { return i; }
     }
     return -1;
+}
+
+// Число запущенных сценариев (нужно для лимита MACRO_MAX_RUNNING).
+uint8_t CLASS_MODULE_MACROS::runningCount() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < _fileCount; i++) {
+        if (_files[i].run) { n++; }
+    }
+    return n;
 }
 
 bool CLASS_MODULE_MACROS::nameOk(const String& name) {
@@ -958,15 +995,13 @@ bool CLASS_MODULE_MACROS::createNewFile(const String& base, String& fullPath) {
     fullPath = MACROS_DIR_RE + cand;
 
     String empty;
-    empty  = "-- Новый сценарий (Lua). Каждое правило: when + одно действие set/call/calls/run.\r\n";
-    empty += "-- meta_cron = \"...\" задаёт окно (гейт) для всего файла; без него — активен всегда.\r\n";
-    empty += "return {\r\n";
-    empty += "    desc = \"new scenario\",\r\n";
-    empty += "    -- meta_cron = \"*/10 * * * * *\",\r\n";
-    empty += "    rules = {\r\n";
-    empty += "        -- { when = { cron = \"0 * * * * *\" }, set = \"e7.effect\", value = 1 },\r\n";
-    empty += "    },\r\n";
-    empty += "}\r\n";
+    empty  = "-- Новый сценарий (реальный Lua). Тело файла исполняется раз в секунду.\r\n";
+    empty += "-- Ресурсы: ns.field (чтение/запись), ns.func(args) (вызов).\r\n";
+    empty += "meta{ desc = \"new scenario\" }\r\n";
+    empty += "\r\n";
+    empty += "every(\"*/10 * * * * *\", function()\r\n";
+    empty += "    -- e7.effect = \"mono\"\r\n";
+    empty += "end)\r\n";
     if (writeFile(fullPath, empty) == false) { return false; }
 
     if (addFileEntry(cand, 7, false) == false) {
@@ -997,6 +1032,14 @@ bool CLASS_MODULE_MACROS::setFileRun(const String& base, bool on) {
     String path = MACROS_DIR_RE + base;
     int idx = findFile(path);
     if (idx < 0) { return false; }
+
+    // Лимит одновременно запущенных сценариев: при достижении потолка новый
+    // запуск отклоняется (защита от перегрузки loop-задачи Lua и гонок с вебом).
+    if (on && !_files[idx].run && runningCount() >= MACRO_MAX_RUNNING) {
+        DEBUGMACROS("%s: run limit %d reached, '%s' not started\r\n",
+                    __FUNCTION__, MACRO_MAX_RUNNING, base.c_str());
+        return false;
+    }
 
     if (_files[idx].run != on) {
         _files[idx].run = on;
@@ -1049,17 +1092,20 @@ bool CLASS_MODULE_MACROS::renameFileEntry(const String& oldBase, const String& n
 // ============================================================
 
 bool CLASS_MODULE_MACROS::reloadAll() {
+    MacroLockGuard lk(_lock);
     bumpMeta();
     return true;
 }
 
-bool CLASS_MODULE_MACROS::fireToken(uint8_t type, const String& spec) {
+bool CLASS_MODULE_MACROS::fireToken(uint8_t type, const String& spec, const BusValue& value) {
+    MacroLockGuard lk(_lock);   // очередь событий общая с тиком (loop)
     if (spec.length() == 0) { return false; }
-    if (type != MACRO_RULE_TERM && type != MACRO_RULE_BUTTON && type != MACRO_RULE_EVENT) { return false; }
+    if (type != MACRO_H_TERM && type != MACRO_H_BUTTON && type != MACRO_H_ON) { return false; }
     uint8_t next = (uint8_t)((_evIn + 1) % MACRO_EV_QUEUE);
     if (next == _evOut) { return false; } // очередь заполнена
     _evQueue[_evIn].type = type;
     _evQueue[_evIn].spec = spec;
+    _evQueue[_evIn].value = value;
     _evIn = next;
     return true;
 }
@@ -1072,30 +1118,31 @@ void CLASS_MODULE_MACROS::printList() {
     Serial.printf("[MACRO] enabled: %d, files: %d\r\n", _config.enabled, _fileCount);
     for (uint8_t i = 0; i < _fileCount; i++) {
         MacroFile& f = _files[i];
-        Serial.printf("  [%d] prio=%d run=%d active=%d %s (%d rules)%s%s\r\n",
+        Serial.printf("  [%d] prio=%d run=%d active=%d %s (%d handlers)%s%s\r\n",
                       i,
                       f.prio,
                       f.run ? 1 : 0,
                       f.active ? 1 : 0,
                       f.name.c_str(),
-                      f.nRules,
+                      f.nHandlers,
                       f.err.length() > 0 ? " err=" : "",
                       f.err.c_str());
-        if (f.rules == NULL) { continue; }
-        for (uint8_t j = 0; j < f.nRules; j++) {
-            MacroRule& r = f.rules[j];
-            String cond = macroRuleCondStr(r);
-            String action;
-            if (r.setTarget.length() > 0) {
-                action = String("set=") + r.setTarget;
-            } else if (r.handler.length() > 0) {
-                action = String("run=") + r.handler;
-            } else {
-                action = String("calls=") + String(r.nActions);
+        if (f.handlers == NULL) { continue; }
+        for (uint8_t j = 0; j < f.nHandlers; j++) {
+            MacroHandler& h = f.handlers[j];
+            const char* tn = "?";
+            switch (h.type) {
+                case MACRO_H_CRON:     tn = "every.cron"; break;
+                case MACRO_H_INTERVAL: tn = "every.sec";  break;
+                case MACRO_H_AFTER:    tn = "after";      break;
+                case MACRO_H_ONCE:     tn = "once";       break;
+                case MACRO_H_TICK:     tn = "tick";       break;
+                case MACRO_H_TERM:     tn = "term";       break;
+                case MACRO_H_BUTTON:   tn = "button";     break;
+                case MACRO_H_ON:       tn = "on";         break;
+                default: break;
             }
-            Serial.printf("      #%d %s spec='%s' cond='%s' %s\r\n",
-                          j, macroRuleTypeStr(r.type), r.spec.c_str(),
-                          cond.c_str(), action.c_str());
+            Serial.printf("      #%d %s key='%s'\r\n", j, tn, h.key.c_str());
         }
     }
 }
@@ -1114,6 +1161,7 @@ void macroTickTask() {
 // ============================================================
 
 void macroCmd() {
+    MacroLockGuard lk(module_macros._lock);
     String arg = term.getNext();
 
     if (arg == "list") {
@@ -1165,8 +1213,8 @@ void macroCmd() {
         return;
     }
     if (arg == "msg" || arg == "btn") {
-        uint8_t type = (arg == "msg") ? MACRO_RULE_TERM : MACRO_RULE_BUTTON;
-        const char* what = (type == MACRO_RULE_TERM) ? "term" : "button";
+        uint8_t type = (arg == "msg") ? MACRO_H_TERM : MACRO_H_BUTTON;
+        const char* what = (type == MACRO_H_TERM) ? "term" : "button";
 
         // Собираем ВСЕ слова аргументов в одну строку (спецификатор с параметрами)
         String spec;

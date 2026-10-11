@@ -2,8 +2,9 @@
 #define _MODULE_MACROS_ENGINE_h
 
 // ============================================================
-// module_macros_engine.h — данные и интерфейс «барабана» сценариев:
-// один Lua-интерпретатор + декларативные правила (cron/cond/term/button/on/body).
+// module_macros_engine.h — декларативные данные «барабана» сценариев:
+// один Lua-интерпретатор, файл = Lua-чанк (тело тикает раз в секунду),
+// ресурсные namespace-прокси поверх core_state, планировщик cron/every.
 // Реализация: module_macros_engine.cpp
 // ============================================================
 
@@ -15,13 +16,11 @@
 
 // Ограничения (модуль предназначен только для ESP32).
 // Бюджет heap модуля — MACRO_HEAP_BUDGET (100 КБ). Оценка: фиксированная
-// часть (~33 КБ: один lua_State, MacroFile[40], кэш каталога, транзиент) плюс
-// правила (sizeof(MacroRule) ~192 Б + строки на heap). Проверка — /macros/heap.
+// часть (один lua_State, MacroFile[40], кэш каталога, транзиент) плюс
+// активные файлы (chunk/env/state + массив обработчиков). Проверка — /macros/heap.
 #define MACRO_MAX_FILES       40     ///< максимум файлов-сценариев в списке
-#define MACRO_MAX_RULES       8      ///< максимум правил в одном файле
-#define MACRO_MAX_ACTIONS     4      ///< максимум bus-вызовов в одном правиле
-#define MACRO_CALL_MAX_ARGS   4      ///< максимум аргументов одного вызова
-#define MACRO_MAX_CONDS       4      ///< максимум cond-условий в одном правиле (AND)
+#define MACRO_MAX_RUNNING     12     ///< максимум одновременно запущенных сценариев
+#define MACRO_MAX_HANDLERS    8      ///< максимум обработчиков в одном файле
 #define MACRO_EV_QUEUE        8      ///< размер очереди внешних событий (term/button/on)
 #define MACRO_MAX_EVENT_SUBS  8      ///< максимум уникальных событий шины в подписке
 
@@ -38,74 +37,46 @@
 #define MACRO_LUA_MIN_HEAP    (24UL * 1024) ///< порог heap для запуска Lua, байт
 
 // Кэш каталога ресурсов (/macros/resources): пересобираем не чаще, чем раз в TTL.
-// Защита от лавины тяжёлых JsonDocument при параллельных запросах (переполнение heap → abort).
 #define MACRO_RES_CACHE_MS    1000UL ///< TTL кэша каталога ресурсов, мс
 
-// Регистрация правил: не более N файлов за тик и не более M авто-повторов.
+// Регистрация файлов: не более N за тик и не более M авто-повторов.
 #define MACRO_PARSE_PER_TICK  2      ///< максимум регистраций за тик
 #define MACRO_PARSE_MAX_RETRY 3      ///< максимум авто-повторов после OOM
+#define MACRO_BODY_PER_TICK   6      ///< максимум тел сценариев, исполняемых за тик (round-robin)
 
 // Минимальная «правдоподобная» метка времени создания файла (2001-09-09).
 #define MACRO_CREATED_MIN     1000000000UL
 
 // Скачок времени вперёд больше порога (NTP-синк, смена TZ, ручной time.set):
-// cron-правила пропускают «прошлые» срабатывания (пересчёт next без выполнения).
+// расписания пропускают «прошлые» срабатывания (пересчёт next без выполнения).
 #define MACRO_CRON_JUMP_MAX_S 120
 
-/// Типы правил
-#define MACRO_RULE_CRON       0      ///< момент времени по cron-выражению
-#define MACRO_RULE_COND       1      ///< условие (ресурс+оператор+значение), фронт false->true
-#define MACRO_RULE_BUTTON     2      ///< кнопка с веб-страницы (macro btn)
-#define MACRO_RULE_TERM       3      ///< команда терминала (macro msg)
-#define MACRO_RULE_BODY       4      ///< тело без when (по открытию мета-окна)
-#define MACRO_RULE_EVENT      5      ///< событие ресурсной шины (on="...")
+/// Типы обработчиков файла (per-file registry)
+#define MACRO_H_CRON      0   ///< every("cron-выражение", fn)
+#define MACRO_H_INTERVAL  1   ///< every(N, fn) — каждые N секунд
+#define MACRO_H_AFTER     2   ///< after(N, fn) — один раз через N секунд
+#define MACRO_H_ONCE      3   ///< once(fn) — на следующем тике
+#define MACRO_H_TICK      4   ///< tick(fn) — каждый тик (в дополнение к телу)
+#define MACRO_H_TERM      5   ///< term(spec, fn) — терминал "macro msg"
+#define MACRO_H_BUTTON    6   ///< button(name, fn) — "macro btn"
+#define MACRO_H_ON        7   ///< on(event, fn) — событие ресурсной шины
 
-/// Операторы условия cond
-#define MACRO_COND_EQ         0
-#define MACRO_COND_NE         1
-#define MACRO_COND_LT         2
-#define MACRO_COND_LE         3
-#define MACRO_COND_GT         4
-#define MACRO_COND_GE         5
-#define MACRO_COND_CHANGED    6
+/// Один обработчик файла: зарегистрированная Lua-функция + расписание/ключ.
+typedef struct {
+    uint8_t  type;      ///< MACRO_H_*
+    String   key;       ///< pattern / секунды / callsite / spec / имя события
+    int      fnRef;     ///< ссылка Lua registry на closure (LUA_NOREF = -1)
+    cron_expr expr;     ///< разобранный cron (только MACRO_H_CRON)
+    time_t   next;      ///< следующий момент, epoch (CRON; 0 — нет)
+    uint32_t dueMs;     ///< следующий момент, millis() (INTERVAL/AFTER/ONCE)
+} MacroHandler;
 
 /// Внешнее событие (очередь term/button/on)
 typedef struct {
-    uint8_t type;            ///< MACRO_RULE_BUTTON / MACRO_RULE_TERM / MACRO_RULE_EVENT
-    String  spec;            ///< спецификатор (слова term/button или имя события)
+    uint8_t  type;      ///< MACRO_H_TERM / MACRO_H_BUTTON / MACRO_H_ON
+    String   spec;      ///< спецификатор (слова term/button или имя события)
+    BusValue value;     ///< значение события шины (для on)
 } MacroEvent;
-
-/// Одно cond-условие правила (структурно, без строковой сериализации)
-typedef struct {
-    String   res;            ///< "ns.field"
-    uint8_t  op;             ///< MACRO_COND_*
-    BusValue val;            ///< целевое значение (op != changed)
-} MacroCond;
-
-/// Одно правило файла (декларативное)
-typedef struct {
-    uint8_t   type;          ///< MACRO_RULE_* (первичный триггер или COND/BODY)
-    String    spec;          ///< cron / term / button / имя события
-    cron_expr expr;          ///< разобранный cron (для MACRO_RULE_CRON)
-    time_t    next;          ///< следующее срабатывание cron (0 — не инициализировано)
-    bool      lastCond;      ///< прошлое состояние (фронт для cond/body)
-
-    // Составное условие when: 0..MACRO_MAX_CONDS cond-проверок (AND)
-    MacroCond conds[MACRO_MAX_CONDS];
-    uint8_t   nConds;
-    String    lastVals[MACRO_MAX_CONDS]; ///< прошлые значения (для op=changed)
-    bool      haveLast[MACRO_MAX_CONDS];
-
-    // Действие: либо handler (Lua), либо setTarget, либо декларативные bus-вызовы
-    String    setTarget;     ///< set="ns.field" (пусто, если действие call/calls/run)
-    BusValue  setValue;      ///< значение для set (коэрсится к типу ресурса при вызове)
-    String    handler;       ///< run="имя" — тяжёлый путь (перечитывает файл и компилирует Lua)
-    String    handlerArgs;   ///< сериализованные аргументы handler "i:1|s:foo"
-    String    actions[MACRO_MAX_ACTIONS]; ///< "ns.func|i:1|s:foo"
-    uint8_t   nActions;
-
-    uint32_t  sub;           ///< подписка на событие шины (только MACRO_RULE_EVENT)
-} MacroRule;
 
 /// Файл-сценарий: метаданные (сохраняются в JSON) + runtime-состояние
 typedef struct MacroFile {
@@ -114,23 +85,21 @@ typedef struct MacroFile {
     uint8_t   prio;          ///< приоритет 0..7 (0 — высший)
     bool      run;           ///< включён пользователем
     uint32_t  created;       ///< время создания (локальное, TimeLib)
-    String    metaCron;      ///< cron-выражение окна (из поля meta_cron файла; "" = без гейта)
     uint32_t  size;          ///< размер файла на FS (кэш для веб-таблицы)
 
     // --- runtime-состояние (не сохраняется) ---
-    bool      active;        ///< файл зарегистрирован (правила разобраны)
+    bool      active;        ///< файл скомпилирован (чанк + окружение живы)
     String    err;           ///< текст последней ошибки (пусто — ошибок нет)
-    String    desc;          ///< описание из таблицы сценария
-    bool      needParse;     ///< требуется (пере)регистрация правил
-    uint8_t   parseFails;    ///< счётчик подряд неудачных регистраций (защита от OOM-цикла)
-    MacroRule* rules;        ///< динамический массив правил (heap)
-    uint8_t   nRules;        ///< число правил
+    String    desc;          ///< описание из meta{ desc = ... }
+    bool      needParse;     ///< требуется (пере)компиляция файла
+    uint8_t   parseFails;    ///< счётчик подряд неудачных компиляций (защита от OOM)
 
-    // Мета-cron (гейт окна)
-    cron_expr metaExpr;
-    bool      metaValid;     ///< cron разобран успешно
-    bool      metaInit;      ///< next инициализирован
-    time_t    metaNext;      ///< следующее срабатывание мета-cron
+    int       chunkRef;      ///< Lua registry: скомпилированный чанк (LUA_NOREF = -1)
+    int       envRef;        ///< Lua registry: окружение файла (_ENV)
+    int       stateRef;      ///< Lua registry: персистентная таблица state
+
+    MacroHandler* handlers;  ///< динамический массив обработчиков (heap)
+    uint8_t   nHandlers;     ///< число зарегистрированных обработчиков
 } MacroFile;
 
 /// Структура конфига — сохраняется в config_macros.json
@@ -138,21 +107,19 @@ typedef struct {
     bool enabled;            ///< модуль включён
 } strMacrosConfig;
 
-// Отладочная сериализация условий правила (собирается на месте, не хранится).
-String macroRuleCondStr(const MacroRule& r);
-// Текстовое имя оператора cond (обратное к macroOpCode).
-const char* macroCondOpName(uint8_t op);
-// Текстовое имя типа правила (для printList).
-const char* macroRuleTypeStr(uint8_t type);
+// Валидация сценария без регистрации файла: компиляция + пробный прогон тела
+// (побочные bus-действия и планирование подавлены). Возвращает true, если
+// ошибок нет; err — первая ошибка. Стек Lua очищается.
+bool macroValidateScript(EspLuaEngine& eng, const String& content, String& err);
 
-// Валидация сценария без регистрации файла: синтаксис + rules + meta_cron.
-// Возвращает true, если ошибок нет; err — первая ошибка. Стек Lua очищается.
-bool macroValidateScenario(EspLuaEngine& eng, const String& content, String& err);
+// Регистрирует глобальные функции сценария (every/on/print/…) на интерпретаторе.
+// Нужна для изолированного движка валидации (веб-задача не трогает _lua).
+bool macroRegisterHelpers(EspLuaEngine& eng);
 
-// Читает только описательные поля сценария (desc, meta_cron) без разбора rules —
-// для заполнения веб-таблицы у остановленных файлов. bus-функции на время
-// исполнения top-level — no-op (без побочных эффектов). Стек Lua очищается.
+// Читает только описание сценария (meta{desc=...}) без запуска живого файла —
+// для заполнения веб-таблицы у остановленных файлов. Прогон в изолированной
+// песочнице с подавлением bus-действий. Стек Lua очищается.
 bool macroReadScenarioMeta(EspLuaEngine& eng, const String& content,
-                           String& desc, String& metaCron, String& err);
+                           String& desc, String& err);
 
 #endif // _MODULE_MACROS_ENGINE_h

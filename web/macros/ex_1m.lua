@@ -1,7 +1,6 @@
--- Демонстрация: cron прямо в правиле (when), без мета-окна.
-return {
-    desc = "every minute via when.cron",
-    rules = {
-        { when = { cron = "0 * * * * *" }, call = "e7.brightness", args = { 8 } },
-    },
-}
+-- каждая минута: яркость = 8.
+meta{ desc = "every minute: brightness = 8" }
+
+every("0 * * * * *", function()
+    e7.brightness = 8
+end)

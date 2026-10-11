@@ -1,8 +1,11 @@
 -- WTEST-01 (19:00): автономный режим + гейт macro (DENIED/BAD_VALUE) + красный.
+meta{ desc = "WTEST-01 19:00 auto + gate" }
+
 local function one(fn, ...)
     local v, rc = call(fn, ...)
     print("PROBE", fn, "rc=", rc, "v=", v)
 end
+
 local function probeAuto()
     one("wifi.force_ap")
     one("wifi.force_ap_kick")
@@ -14,19 +17,16 @@ local function probeAuto()
     local v, rc = call("wifi.mode", 5)
     print("PROBE wifi.mode(5) rc=", rc, "v=", v)
 end
-return {
-    desc = "WTEST-01 19:00 auto + gate",
-    handlers = { p = function(ev) probeAuto() end },
-    rules = {
-        { when = { cron = "0 0 19 * * *" }, calls = {
-            { name = "wifi.mode", args = { "auto" } },
-            { name = "e7.mode",   args = { "macro" } },
-            { name = "e7.effect", args = { "mono" } },
-            { name = "e7.color",  args = { 16711680 } },
-        } },
-        { when = { cron = "0 3 19 * * *" }, run = "p" },
-        { when = { cron = "0 7 19 * * *" }, calls = {
-            { name = "wifi.mode", args = { "macro" } },
-        } },
-    },
-}
+
+every("0 0 19 * * *", function()
+    wifi.mode("auto")
+    e7.mode("macro")
+    e7.effect("mono")
+    e7.color(16711680)
+end)
+
+every("0 3 19 * * *", probeAuto)
+
+every("0 7 19 * * *", function()
+    wifi.mode("macro")
+end)

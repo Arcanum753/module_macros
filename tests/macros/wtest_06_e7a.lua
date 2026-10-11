@@ -1,4 +1,6 @@
 -- WTEST-06 (20:12): яркость границы + e7 ошибки/гейтинг + e7.save.
+meta{ desc = "WTEST-06 20:12 brightness+errors" }
+
 local function bad()
     print("E7 effect bogus rc=",   set("e7.effect", "bogus"))
     print("E7 effect 9 rc=",       set("e7.effect", 9))
@@ -9,6 +11,7 @@ local function bad()
     print("E7 brightness 300 rc=", set("e7.brightness", 300))
     print("E7 color -1 rc=",       set("e7.color", -1))
 end
+
 local function deny()
     print("E7 set off rc=",     set("e7.mode", "off"))
     print("E7 effect mono rc=", set("e7.effect", "mono"))
@@ -16,20 +19,15 @@ local function deny()
     print("E7 effect mono rc=", set("e7.effect", "mono"))
     print("E7 set macro rc=",   set("e7.mode", "macro"))
 end
-return {
-    desc = "WTEST-06 20:12 brightness+errors",
-    handlers = {
-        bad  = function() bad() end,
-        deny = function() deny() end,
-        save = function() print("E7 save rc=", call("e7.save")) end,
-    },
-    rules = {
-        { when = { cron = "0 12 20 * * *" }, call = "e7.brightness", args = { 5 } },
-        { when = { cron = "0 14 20 * * *" }, call = "e7.brightness", args = { 50 } },
-        { when = { cron = "0 16 20 * * *" }, call = "e7.brightness", args = { 255 } },
-        { when = { cron = "0 18 20 * * *" }, run = "bad" },
-        { when = { cron = "0 20 20 * * *" }, run = "deny" },
-        { when = { cron = "0 22 20 * * *" }, run = "save" },
-        { when = { cron = "0 24 20 * * *" }, call = "e7.color", args = { 16711680 } },
-    },
-}
+
+local function save()
+    print("E7 save rc=", call("e7.save"))
+end
+
+every("0 12 20 * * *", function() e7.brightness = 5 end)
+every("0 14 20 * * *", function() e7.brightness = 50 end)
+every("0 16 20 * * *", function() e7.brightness = 255 end)
+every("0 18 20 * * *", bad)
+every("0 20 20 * * *", deny)
+every("0 22 20 * * *", save)
+every("0 24 20 * * *", function() e7.color(16711680) end)

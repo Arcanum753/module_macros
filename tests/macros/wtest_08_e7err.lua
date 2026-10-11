@@ -1,4 +1,6 @@
 -- WTEST-08: контрольные снимки состояния (wifi + e7 + time) в ключевых точках.
+meta{ desc = "WTEST-08 checkpoints" }
+
 local function snap(tag)
     print("SNAP", tag,
         "conn=",     get("wifi.connected"),
@@ -17,14 +19,9 @@ local function snap(tag)
         "e7br=",     get("e7.brightness"),
         "e7col=",    get("e7.color"))
 end
-return {
-    desc = "WTEST-08 checkpoints",
-    handlers = { s = function(ev) snap(ev.spec) end },
-    rules = {
-        { when = { cron = "0 21 19 * * *" }, run = "s" },
-        { when = { cron = "0 26 19 * * *" }, run = "s" },
-        { when = { cron = "0 41 19 * * *" }, run = "s" },
-        { when = { cron = "0 1 20 * * *" }, run = "s" },
-        { when = { cron = "0 15 20 * * *" }, run = "s" },
-    },
-}
+
+every("0 21 19 * * *", function(ev) snap(ev.spec) end)
+every("0 26 19 * * *", function(ev) snap(ev.spec) end)
+every("0 41 19 * * *", function(ev) snap(ev.spec) end)
+every("0 1 20 * * *",  function(ev) snap(ev.spec) end)
+every("0 15 20 * * *", function(ev) snap(ev.spec) end)

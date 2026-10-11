@@ -1,7 +1,7 @@
 // ============================================================
-// module_macros_engine.cpp — «барабан» сценариев:
-// один Lua-интерпретатор + декларативные правила
-// (cron/cond/term/button/on/body) через ресурсную шину core_state.
+// module_macros_engine.cpp — «барабан» сценариев (реальный Lua):
+// один Lua-интерпретатор, файл = чанк (тело тикает раз в секунду),
+// ресурсные namespace-прокси поверх core_state, планировщик cron/every.
 // ============================================================
 
 #include "module_macros.h"
@@ -10,6 +10,7 @@
 #include "core_state/common_module.h"
 #include "core_ntp/NtpClientLib.h"
 #include "common/TimeLib.h"
+#include "common_module.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -18,9 +19,18 @@
 // Единый счётчик VM-инструкций для защиты от «зависаний» сценария.
 static uint32_t macroLuaSteps = 0;
 
-// При валидации сценария (/macros/validate) bus-функции set/call/mode — no-op,
-// чтобы top-level чанка не давал побочных эффектов на шину.
-static bool macroValidateNoSideEffects = false;
+// Контекст текущего исполняемого файла (тело чанка или обработчик). Всё
+// исполняется в main-loop, поэтому одного статического указателя достаточно.
+static MacroFile* macroCurFile = nullptr;
+
+// При валидации/чтении меты (/macros/validate, refreshFileMeta) побочные
+// действия (запись на шину, планирование) подавляются.
+static bool macroSuppressSideEffects = false;
+
+// Ключи кэшей в Lua registry (light-userdata-адреса уникальны).
+static char MACRO_REG_NSMT    = 0;   // общая метатаблица namespace-прокси
+static char MACRO_REG_NSCACHE = 0;   // кэш namespace-прокси (по имени ns)
+static char MACRO_REG_FNCACHE = 0;   // кэш вызываемых closure (по full-имени)
 
 // Свободный хип для диагностики (ESP32-only модуль).
 static unsigned macroHeapFree() {
@@ -31,11 +41,36 @@ static unsigned macroHeapFree() {
     return v;
 }
 
-// Форвард-объявления статических помощников
+// Форвард-объявления
 static void macroLuaHook(lua_State* L, lua_Debug* ar);
 static String macroLuaPopError(lua_State* L);
 static void macroPushBusValue(lua_State* L, const BusValue& v);
 static bool macroLuaToBusValue(lua_State* L, int idx, BusValue& out);
+static void macroPushStateValue(lua_State* L, const char* full, const BusResInfo& info);
+static void macroPushNsProxy(lua_State* L, const char* ns);
+static void macroPushFnClosure(lua_State* L, const char* full);
+static int macroEnvIndex(lua_State* L);
+static int macroNsIndex(lua_State* L);
+static int macroNsNewindex(lua_State* L);
+static int macroFnCall(lua_State* L);
+static int macroCompileSetup(lua_State* L);
+static int macroCompileChunk(lua_State* L, MacroFile& f, const String& content);
+static bool macroRunBody(lua_State* L, MacroFile& f);
+static bool macroAddHandler(lua_State* L, MacroFile& f, uint8_t type, const String& key,
+                            int fnRef, bool hasCron, const cron_expr* ex, uint32_t dueMs);
+static void macroRemoveHandler(lua_State* L, MacroFile& f, uint8_t idx);
+static void macroCallHandler(lua_State* L, MacroFile& f, MacroHandler& h,
+                             const char* typeName, const BusValue* value);
+static void macroFreeRuntime(lua_State* L, MacroFile& f);
+
+static int macroLuaEvery(lua_State* L);
+static int macroLuaAfter(lua_State* L);
+static int macroLuaOnce(lua_State* L);
+static int macroLuaTick(lua_State* L);
+static int macroLuaOn(lua_State* L);
+static int macroLuaTerm(lua_State* L);
+static int macroLuaButton(lua_State* L);
+static int macroLuaMeta(lua_State* L);
 static int macroLuaGet(lua_State* L);
 static int macroLuaSet(lua_State* L);
 static int macroLuaCall(lua_State* L);
@@ -47,18 +82,6 @@ static int macroLuaNow(lua_State* L);
 static int macroLuaClock(lua_State* L);
 static int macroNoopCb(void* user, int argc, const BusValue* argv, BusValue& result);
 static int macroEventTramp(void* user, int argc, const BusValue* argv, BusValue& result);
-static int macroLoadChunk(lua_State* L, MacroFile& f, const String& content);
-static const char* macroRuleTypeName(uint8_t type);
-static void macroPushEventTable(lua_State* L, MacroRule& r, const BusValue* value);
-static bool macroReadRes(const String& name, BusValue& out);
-static bool macroCompare(const BusValue& cur, uint8_t op, const BusValue& want);
-static uint8_t macroOpCode(const char* s);
-static int macroParseArgs(const String& s, BusValue* out, int max);
-static String macroArgsToStr(lua_State* L, int argsIdx);
-static String macroValueToStr(lua_State* L, int idx);
-static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r);
-static String macroNumText(const BusValue& v);
-static int macroResolveEnum(const char* res, const BusValue& in, BusValue& out, String& err);
 
 // ============================================================
 // Защитный hook и ошибки
@@ -91,61 +114,6 @@ static String macroLuaPopError(lua_State* L) {
 }
 
 // ============================================================
-// Песочница и загрузка чанка
-// ============================================================
-
-// Кладёт на стек свежее окружение (_ENV): запись — в свою таблицу,
-// чтение — через __index в глобальную таблицу (там наши C-функции).
-static void macroPushSandbox(lua_State* L) {
-    lua_newtable(L);              // env
-    lua_newtable(L);              // metatable
-    lua_pushglobaltable(L);
-    lua_setfield(L, -2, "__index");
-    lua_setmetatable(L, -2);
-}
-
-// Обёртка для ПРОТЕКТИРОВАННОЙ установки песочницы: вызывается под lua_pcall,
-// чтобы аллокации таблиц не улетали вне защиты (иначе память → abort()).
-// Аргумент 1 — чанк; возвращает тот же чанк с подставленным _ENV.
-static int macroChunkSetup(lua_State* L) {
-    macroPushSandbox(L);
-    lua_setupvalue(L, 1, 1);      // chunk._ENV = env
-    lua_pushvalue(L, 1);          // вернуть чанк
-    return 1;
-}
-
-// Загружает content как чанк с песочницей и исполняет; при успехе
-// на стеке остаётся одно возвращённое значение (таблица).
-static int macroLoadChunk(lua_State* L, MacroFile& f, const String& content) {
-    if (L == NULL) { f.err = "No interpreter"; return LUA_ERRRUN; }
-
-    String cn = "@";
-    cn += f.name;
-
-    macroLuaSteps = 0;
-    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
-
-    int status = luaL_loadbuffer(L, content.c_str(), content.length(), cn.c_str());
-    if (status == LUA_OK) {
-        // Песочница ставится в защищённом вызове (аллокации таблиц вне pcall → abort).
-        lua_pushcfunction(L, macroChunkSetup);
-        lua_insert(L, -2);                 // [setup, chunk]
-        status = lua_pcall(L, 1, 1, 0);    // -> [chunk]
-    }
-    if (status == LUA_OK) {
-        status = lua_pcall(L, 0, 1, 0);    // исполняем чанк -> [result]
-    }
-    lua_sethook(L, NULL, 0, 0);
-
-    if (status != LUA_OK) {
-        f.err = macroLuaPopError(L);
-        if (f.err.length() == 0) { f.err = "Scenario parse error"; }
-        lua_settop(L, 0);
-    }
-    return status;
-}
-
-// ============================================================
 // Мосты к ресурсной шине core_state
 // ============================================================
 
@@ -162,8 +130,7 @@ static void macroPushBusValue(lua_State* L, const BusValue& v) {
 }
 
 static bool macroLuaToBusValue(lua_State* L, int idx, BusValue& out) {
-    // lua_type, а не lua_isnumber: lua_isnumber() истинно и для числовых СТРОК,
-    // из-за чего "0"/"1" превращались в F32 и STR-функции (wifi.set_slot) получали пустую строку.
+    // lua_type, а не lua_isnumber: lua_isnumber() истинно и для числовых СТРОК.
     int t = lua_type(L, idx);
     if (t == LUA_TBOOLEAN) { out = BusValue::bo(lua_toboolean(L, idx) != 0); return true; }
     if (t == LUA_TNUMBER) {
@@ -175,101 +142,574 @@ static bool macroLuaToBusValue(lua_State* L, int idx, BusValue& out) {
     return false;
 }
 
-// Форматтер числового/булева значения для сообщения об ошибке ENUM.
-// Контракт: вызывается ТОЛЬКО для kind == I32/F32/BOOL/TIME.
-// Для прочих kind возвращает "?" (защита от случайного вызова).
-static String macroNumText(const BusValue& v) {
-    switch (v.kind) {
-        case BusValue::I32:  return String((long)v.i);
-        case BusValue::TIME: return String((long)v.t);
-        case BusValue::BOOL: return String(v.b ? "true" : "false");
-        case BusValue::F32:  return String(v.f, 3);
-        default:             return String("?");
-    }
-}
-
-// Резолв значения для ENUM-ресурса: строка → индекс по enumVals (без учёта регистра),
-// ENUM → как есть, числовые (I32/F32/BOOL/TIME) → ошибка.
-// rc: BUS_OK / BUS_ERR_BAD_VALUE; err — человекочитаемая причина.
-static int macroResolveEnum(const char* res, const BusValue& in, BusValue& out, String& err) {
-    err = "";
-    if (in.kind == BusValue::ENUM) { out = in; return BUS_OK; }
-    if (in.kind == BusValue::STR) {
-        int idx = core_state.enumIndexByName(res, in.s.c_str(), nullptr);
-        if (idx < 0) {
-            err = String(res) + ": unknown enum value '" + in.s + "'";
-            return BUS_ERR_BAD_VALUE;
+// Кладёт текущее значение ресурса: BOOL→boolean, I32/F32/TIME→number,
+// STR→string, ENUM→каноничное имя (строка). Только для ресурсов-состояний.
+static void macroPushStateValue(lua_State* L, const char* full, const BusResInfo& info) {
+    switch (info.kind) {
+        case BusValue::BOOL: lua_pushboolean(L, core_state.getBool(full) ? 1 : 0); break;
+        case BusValue::I32:  lua_pushinteger(L, (lua_Integer)core_state.getInt(full)); break;
+        case BusValue::F32:  lua_pushnumber(L, (lua_Number)core_state.getF32(full)); break;
+        case BusValue::TIME: lua_pushinteger(L, (lua_Integer)core_state.getTime(full)); break;
+        case BusValue::STR:  lua_pushstring(L, core_state.getStr(full).c_str()); break;
+        case BusValue::ENUM: {
+            int32_t idx = core_state.getInt(full);
+            const char* nm = core_state.enumNameByIndex(full, idx);
+            if (nm != NULL) { lua_pushstring(L, nm); } else { lua_pushinteger(L, (lua_Integer)idx); }
+            break;
         }
-        out = BusValue::en((int32_t)idx);
-        return BUS_OK;
+        default: lua_pushnil(L); break;
     }
-    err = String(res) + ": enum requires name, got number " + macroNumText(in);
-    return BUS_ERR_BAD_VALUE;
 }
 
 // ============================================================
-// Команды Lua, доступные внутри named-handler
+// Кэши namespace-прокси и вызываемых closure
 // ============================================================
+
+// Оставляет на стеке registry-таблицу под ключом key (создаёт при отсутствии).
+static void macroGetRegistryTable(lua_State* L, void* key) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, key);
+    if (lua_istable(L, -1)) { return; }
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, key);
+}
+
+static void macroPushNsMetatable(lua_State* L) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &MACRO_REG_NSMT);
+    if (lua_istable(L, -1)) { return; }
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushcfunction(L, macroNsIndex);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, macroNsNewindex);
+    lua_setfield(L, -2, "__newindex");
+    lua_pushvalue(L, -1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &MACRO_REG_NSMT);
+}
+
+static void macroPushNsProxy(lua_State* L, const char* ns) {
+    macroGetRegistryTable(L, &MACRO_REG_NSCACHE);   // [cache]
+    lua_getfield(L, -1, ns);                        // [cache, proxy?]
+    if (lua_istable(L, -1)) { lua_remove(L, -2); return; }
+    lua_pop(L, 1);                                  // [cache]
+
+    lua_newtable(L);                                // [cache, proxy]
+    lua_pushstring(L, ns);
+    lua_setfield(L, -2, "__ns");
+    macroPushNsMetatable(L);                        // [cache, proxy, mt]
+    lua_setmetatable(L, -2);
+    lua_pushvalue(L, -1);                           // [cache, proxy, proxy]
+    lua_setfield(L, -3, ns);                        // cache[ns] = proxy
+    lua_remove(L, -2);                              // [proxy]
+}
+
+static void macroPushFnClosure(lua_State* L, const char* full) {
+    macroGetRegistryTable(L, &MACRO_REG_FNCACHE);   // [cache]
+    lua_getfield(L, -1, full);                      // [cache, fn?]
+    if (lua_isfunction(L, -1)) { lua_remove(L, -2); return; }
+    lua_pop(L, 1);                                  // [cache]
+
+    lua_pushstring(L, full);                        // [cache, full]
+    lua_pushcclosure(L, macroFnCall, 1);            // [cache, fn]
+    lua_pushvalue(L, -1);                           // [cache, fn, fn]
+    lua_setfield(L, -3, full);                      // cache[full] = fn
+    lua_remove(L, -2);                              // [fn]
+}
+
+// ============================================================
+// Методы метатаблиц: env (глобальное окружение) и namespace-прокси
+// ============================================================
+
+// __index окружения файла: сначала namespace, затем обычные глобалы (хелперы).
+static int macroEnvIndex(lua_State* L) {
+    const char* key = lua_tostring(L, 2);
+    if (key == NULL) { lua_pushnil(L); return 1; }
+    if (core_state.hasNamespace(key)) { macroPushNsProxy(L, key); return 1; }
+    lua_pushglobaltable(L);
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);      // [global, value]
+    return 1;
+}
+
+// __index namespace-прокси: ns.field -> состояние/функция ресурса.
+static int macroNsIndex(lua_State* L) {
+    lua_getfield(L, 1, "__ns");                     // [ns]
+    const char* ns = lua_tostring(L, -1);
+    const char* key = lua_tostring(L, 2);
+    if (ns == NULL || key == NULL) { lua_pop(L, 1); lua_pushnil(L); return 1; }
+
+    String full = String(ns) + "." + key;
+    lua_pop(L, 1);
+
+    if (core_state.has(full.c_str()) == false) { lua_pushnil(L); return 1; }
+    BusResInfo info;
+    core_state.info(full.c_str(), info);
+    if (info.isEvent) { lua_pushnil(L); return 1; }
+    if (info.isFunc) { macroPushFnClosure(L, full.c_str()); return 1; }
+    macroPushStateValue(L, full.c_str(), info);
+    return 1;
+}
+
+// __newindex namespace-прокси: запись значения ресурса (ENUM — только строка).
+static int macroNsNewindex(lua_State* L) {
+    lua_getfield(L, 1, "__ns");
+    const char* ns = lua_tostring(L, -1);
+    const char* key = lua_tostring(L, 2);
+    String full = String(ns != NULL ? ns : "") + "." + String(key != NULL ? key : "");
+    lua_pop(L, 1);
+
+    if (core_state.has(full.c_str()) == false) {
+        return luaL_error(L, "unknown resource: %s", full.c_str());
+    }
+    BusResInfo info;
+    core_state.info(full.c_str(), info);
+
+    BusValue v;
+    if (info.kind == BusValue::ENUM) {
+        // Для ENUM принимается ТОЛЬКО буквенное имя; числа отвергаются.
+        if (lua_type(L, 3) != LUA_TSTRING) {
+            return luaL_error(L, "enum %s requires name, got number", full.c_str());
+        }
+        const char* name = lua_tostring(L, 3);
+        int idx = core_state.enumIndexByName(full.c_str(), name, nullptr);
+        if (idx < 0) {
+            return luaL_error(L, "unknown enum value '%s' for %s", name, full.c_str());
+        }
+        v = BusValue::en(idx);
+    } else {
+        if (macroLuaToBusValue(L, 3, v) == false) {
+            return luaL_error(L, "bad value for %s", full.c_str());
+        }
+    }
+
+    if (macroSuppressSideEffects) { return 0; }
+    int rc = core_state.applyValue(full.c_str(), v);
+    if (rc != BUS_OK && macroCurFile != NULL) {
+        macroCurFile->err = String("set ") + full + ": " + ns_core_state::busErrStr(rc);
+    }
+    return 0;
+}
+
+// Вызов функции ресурса: e7.speed(50) -> core_state.call (ENUM — строка).
+static int macroFnCall(lua_State* L) {
+    const char* full = lua_tostring(L, lua_upvalueindex(1));
+    if (full == NULL) { lua_pushnil(L); lua_pushinteger(L, BUS_ERR_NOT_FOUND); return 2; }
+
+    int top = lua_gettop(L);
+    if (top > CORE_STATE_MAX_ARGS) { top = CORE_STATE_MAX_ARGS; }
+    BusValue args[CORE_STATE_MAX_ARGS];
+    int argc = 0;
+    for (int i = 1; i <= top; i++) {
+        if (macroLuaToBusValue(L, i, args[argc])) { argc++; }
+    }
+
+    if (macroSuppressSideEffects) {
+        lua_pushnil(L);
+        lua_pushinteger(L, BUS_OK);
+        return 2;
+    }
+
+    BusResInfo info;
+    bool haveInfo = (core_state.info(full, info) == BUS_OK);
+
+    // ENUM-функция (dual ENUM): первый аргумент — буквенное имя, не число.
+    if (haveInfo && argc >= 1 && info.kind == BusValue::ENUM) {
+        if (lua_type(L, 1) != LUA_TSTRING) {
+            return luaL_error(L, "enum %s requires name, got number", full);
+        }
+        const char* name = lua_tostring(L, 1);
+        int idx = core_state.enumIndexByName(full, name, nullptr);
+        if (idx < 0) {
+            return luaL_error(L, "unknown enum value '%s' for %s", name, full);
+        }
+        args[0] = BusValue::en(idx);
+    }
+
+    // call на чистом state-ресурсе = set (как и раньше).
+    if (haveInfo && !info.isFunc && info.kind != BusValue::NONE) {
+        BusValue v = (argc > 0) ? args[0] : BusValue();
+        int rc = core_state.applyValue(full, v);
+        BusValue rv = core_state.valueToKind(v, info.kind);
+        macroPushBusValue(L, rv);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
+
+    BusValue result;
+    int rc = core_state.call(full, argc, (argc > 0) ? args : nullptr, result);
+    if (rc == BUS_OK) {
+        macroPushBusValue(L, result);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+}
+
+// ============================================================
+// Компиляция чанка и создание окружения
+// ============================================================
+
+// Создаёт per-file окружение (_ENV) и таблицу state; refs кладёт в macroCurFile.
+// Выполняется под lua_pcall (аллокации таблиц вне защиты → abort()).
+static int macroCompileSetup(lua_State* L) {
+    lua_newtable(L);                 // [chunk, state]
+    int stateIdx = lua_gettop(L);
+    lua_newtable(L);                 // [chunk, state, env]
+    int envIdx = lua_gettop(L);
+    lua_newtable(L);                 // [chunk, state, env, mt]
+    lua_pushcfunction(L, macroEnvIndex);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, envIdx);
+
+    lua_pushvalue(L, stateIdx);
+    lua_setfield(L, envIdx, "state");
+
+    lua_pushvalue(L, envIdx);
+    lua_setupvalue(L, 1, 1);         // chunk._ENV = env (pops env-copy)
+
+    if (macroCurFile != NULL) {
+        lua_pushvalue(L, stateIdx);
+        macroCurFile->stateRef = luaL_ref(L, LUA_REGISTRYINDEX);
+        lua_pushvalue(L, envIdx);
+        macroCurFile->envRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    lua_pushvalue(L, 1);             // вернуть чанк
+    return 1;
+}
+
+// Компилирует content как чанк с песочницей; результат — ref в f.chunkRef.
+static int macroCompileChunk(lua_State* L, MacroFile& f, const String& content) {
+    if (L == NULL) { f.err = "No interpreter"; return LUA_ERRRUN; }
+
+    f.chunkRef = LUA_NOREF;
+    f.envRef = LUA_NOREF;
+    f.stateRef = LUA_NOREF;
+
+    String cn = "@";
+    cn += f.name;
+
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
+
+    int status = luaL_loadbuffer(L, content.c_str(), content.length(), cn.c_str());
+    if (status == LUA_OK) {
+        macroCurFile = &f;
+        lua_pushcfunction(L, macroCompileSetup);
+        lua_insert(L, -2);                 // [setup, chunk]
+        status = lua_pcall(L, 1, 1, 0);    // -> [chunk]
+        macroCurFile = nullptr;
+    }
+    lua_sethook(L, NULL, 0, 0);
+
+    if (status != LUA_OK) {
+        f.err = macroLuaPopError(L);
+        if (f.err.length() == 0) { f.err = "Scenario parse error"; }
+        lua_settop(L, 0);
+        return status;
+    }
+    f.chunkRef = luaL_ref(L, LUA_REGISTRYINDEX);   // pops chunk
+    return LUA_OK;
+}
+
+// Исполняет тело чанка (top-level) текущего файла.
+static bool macroRunBody(lua_State* L, MacroFile& f) {
+    if (L == NULL || f.chunkRef == LUA_NOREF) { return false; }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, f.chunkRef);   // [chunk]
+    macroCurFile = &f;
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
+    int status = lua_pcall(L, 0, 0, 0);
+    lua_sethook(L, NULL, 0, 0);
+    macroCurFile = nullptr;
+
+    if (status != LUA_OK) {
+        f.err = macroLuaPopError(L);
+        return false;
+    }
+    return true;
+}
+
+// Освобождает refs/обработчики runtime-файла (без подписок).
+static void macroFreeRuntime(lua_State* L, MacroFile& f) {
+    if (L != NULL) {
+        if (f.handlers != NULL) {
+            for (uint8_t i = 0; i < f.nHandlers; i++) {
+                if (f.handlers[i].fnRef != LUA_NOREF) {
+                    luaL_unref(L, LUA_REGISTRYINDEX, f.handlers[i].fnRef);
+                }
+            }
+        }
+        if (f.chunkRef != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, f.chunkRef); }
+        if (f.envRef != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, f.envRef); }
+        if (f.stateRef != LUA_NOREF) { luaL_unref(L, LUA_REGISTRYINDEX, f.stateRef); }
+    }
+    if (f.handlers != NULL) { delete[] f.handlers; f.handlers = NULL; }
+    f.nHandlers = 0;
+    f.chunkRef = f.envRef = f.stateRef = LUA_NOREF;
+}
+
+// ============================================================
+// Реестр обработчиков файла
+// ============================================================
+
+// Добавляет/заменяет обработчик. При замене расписание сохраняется (тело файла
+// выполняется каждый тик и перерегистрирует функции — расписание не сбрасывается).
+static bool macroAddHandler(lua_State* L, MacroFile& f, uint8_t type, const String& key,
+                            int fnRef, bool hasCron, const cron_expr* ex, uint32_t dueMs) {
+    if (f.handlers == NULL) {
+        luaL_unref(L, LUA_REGISTRYINDEX, fnRef);
+        return false;
+    }
+    for (uint8_t i = 0; i < f.nHandlers; i++) {
+        if (f.handlers[i].type == type && f.handlers[i].key == key) {
+            if (f.handlers[i].fnRef != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, f.handlers[i].fnRef);
+            }
+            f.handlers[i].fnRef = fnRef;
+            if (hasCron && ex != NULL) { f.handlers[i].expr = *ex; }
+            return true;
+        }
+    }
+    if (f.nHandlers >= MACRO_MAX_HANDLERS) {
+        f.err = "too many handlers";
+        luaL_unref(L, LUA_REGISTRYINDEX, fnRef);
+        return false;
+    }
+    MacroHandler& h = f.handlers[f.nHandlers];
+    h.type = type;
+    h.key = key;
+    h.fnRef = fnRef;
+    h.next = 0;
+    h.dueMs = dueMs;
+    if (hasCron && ex != NULL) { h.expr = *ex; } else { memset(&h.expr, 0, sizeof(h.expr)); }
+    f.nHandlers++;
+    return true;
+}
+
+static void macroRemoveHandler(lua_State* L, MacroFile& f, uint8_t idx) {
+    if (idx >= f.nHandlers) { return; }
+    if (f.handlers[idx].fnRef != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, f.handlers[idx].fnRef);
+    }
+    for (uint8_t j = idx; j + 1 < f.nHandlers; j++) { f.handlers[j] = f.handlers[j + 1]; }
+    f.nHandlers--;
+}
+
+// Строит таблицу события в защищённом вызове (аллокации вне pcall → abort()).
+struct MacroEvCtx { const char* type; const char* spec; const BusValue* value; };
+static MacroEvCtx macroEvCtx;
+static String macroEvSpec;   // живёт до конца pcall (spec без служебного суффикса)
+
+static int macroPushEventTableC(lua_State* L) {
+    lua_newtable(L);
+    lua_pushstring(L, macroEvCtx.type ? macroEvCtx.type : "");
+    lua_setfield(L, -2, "type");
+    lua_pushstring(L, macroEvCtx.spec ? macroEvCtx.spec : "");
+    lua_setfield(L, -2, "spec");
+    if (macroEvCtx.value != NULL) {
+        macroPushBusValue(L, *macroEvCtx.value);
+        lua_setfield(L, -2, "value");
+    }
+    return 1;
+}
+
+// Вызывает обработчик с таблицей события {type, spec, value?}.
+static void macroCallHandler(lua_State* L, MacroFile& f, MacroHandler& h,
+                             const char* typeName, const BusValue* value) {
+    if (h.fnRef == LUA_NOREF) { return; }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { f.err = "low memory"; return; }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, h.fnRef);      // [fn]
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+
+    macroEvCtx.type = typeName;
+    // spec без служебного суффикса "@<source:line>" (cron/interval).
+    macroEvSpec = h.key;
+    int at = macroEvSpec.indexOf('@');
+    if (at >= 0) { macroEvSpec = macroEvSpec.substring(0, at); }
+    macroEvCtx.spec = macroEvSpec.c_str();
+    macroEvCtx.value = value;
+    lua_pushlightuserdata(L, &macroEvCtx);
+    lua_pushcclosure(L, macroPushEventTableC, 1);    // [fn, evbuilder]
+
+    macroLuaSteps = 0;
+    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
+    int status = lua_pcall(L, 0, 1, 0);              // -> [fn, ev]
+    if (status == LUA_OK) {
+        macroCurFile = &f;
+        status = lua_pcall(L, 1, 0, 0);
+        macroCurFile = nullptr;
+    }
+    lua_sethook(L, NULL, 0, 0);
+
+    if (status != LUA_OK) {
+        String e = macroLuaPopError(L);
+        if (e.length() > 0 && f.err.length() == 0) { f.err = e; }
+    }
+}
+
+// ============================================================
+// Глобальные функции сценария
+// ============================================================
+
+// Ключ планировщика по месту вызова (source:line) — идемпотентность after/once/tick.
+static String macroCallSite(lua_State* L) {
+    lua_Debug ar;
+    if (lua_getstack(L, 1, &ar) == 0) { return String("?"); }
+    lua_getinfo(L, "Sl", &ar);
+    String s = (ar.short_src != NULL) ? String(ar.short_src) : String("?");
+    s += ":";
+    s += String(ar.currentline);
+    return s;
+}
+
+static int macroLuaEvery(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    if (!lua_isfunction(L, 2)) { return luaL_error(L, "every: function required"); }
+
+    uint8_t type;
+    String key;
+    cron_expr ex;
+    bool hasCron = false;
+    uint32_t dueMs = 0;
+    memset(&ex, 0, sizeof(ex));
+
+    if (lua_type(L, 1) == LUA_TNUMBER) {
+        int secs = (int)lua_tointeger(L, 1);
+        if (secs < 1) { secs = 1; }
+        type = MACRO_H_INTERVAL;
+        key = String(secs);
+        dueMs = millis() + (uint32_t)secs * 1000UL;
+    } else if (lua_isstring(L, 1)) {
+        type = MACRO_H_CRON;
+        String pattern = String(lua_tostring(L, 1));
+        // Ключ = шаблон + место вызова: два разных every() в одном файле не
+        // перекрываются, а повторная регистрация из того же места — идемпотентна.
+        key = pattern + "@" + macroCallSite(L);
+        String norm = ns_module_macros::macroCronNormalize(pattern);
+        const char* perr = NULL;
+        cron_parse_expr(norm.c_str(), &ex, &perr);
+        if (perr != NULL) { return luaL_error(L, "cron error: %s", perr); }
+        hasCron = true;
+    } else {
+        return luaL_error(L, "every: pattern or seconds required");
+    }
+
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, type, key, ref, hasCron, &ex, dueMs);
+    return 0;
+}
+
+static int macroLuaAfter(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    if (!lua_isfunction(L, 2)) { return luaL_error(L, "after: function required"); }
+    int secs = (int)luaL_checkinteger(L, 1);
+    if (secs < 0) { secs = 0; }
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_AFTER, String("after:") + macroCallSite(L),
+                    ref, false, nullptr, millis() + (uint32_t)secs * 1000UL);
+    return 0;
+}
+
+static int macroLuaOnce(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    if (!lua_isfunction(L, 1)) { return luaL_error(L, "once: function required"); }
+    lua_pushvalue(L, 1);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_ONCE, String("once:") + macroCallSite(L),
+                    ref, false, nullptr, millis());
+    return 0;
+}
+
+static int macroLuaTick(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    if (!lua_isfunction(L, 1)) { return luaL_error(L, "tick: function required"); }
+    lua_pushvalue(L, 1);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_TICK, String("tick:") + macroCallSite(L),
+                    ref, false, nullptr, 0);
+    return 0;
+}
+
+static int macroLuaOn(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    const char* name = luaL_checkstring(L, 1);
+    if (!lua_isfunction(L, 2)) { return luaL_error(L, "on: function required"); }
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_ON, String(name), ref, false, nullptr, 0);
+    module_macros.ensureEventSub(String(name));
+    return 0;
+}
+
+static int macroLuaTerm(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    const char* spec = luaL_checkstring(L, 1);
+    if (!lua_isfunction(L, 2)) { return luaL_error(L, "term: function required"); }
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_TERM, String(spec), ref, false, nullptr, 0);
+    return 0;
+}
+
+static int macroLuaButton(lua_State* L) {
+    if (macroSuppressSideEffects || macroCurFile == NULL) { return 0; }
+    const char* name = luaL_checkstring(L, 1);
+    if (!lua_isfunction(L, 2)) { return luaL_error(L, "button: function required"); }
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    macroAddHandler(L, *macroCurFile, MACRO_H_BUTTON, String(name), ref, false, nullptr, 0);
+    return 0;
+}
+
+static int macroLuaMeta(lua_State* L) {
+    if (macroCurFile == NULL || !lua_istable(L, 1)) { return 0; }
+    lua_getfield(L, 1, "desc");
+    if (lua_isstring(L, -1)) { macroCurFile->desc = String(lua_tostring(L, -1)); }
+    lua_pop(L, 1);
+    return 0;
+}
 
 static int macroLuaGet(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if (core_state.has(name) == false) { lua_pushnil(L); return 1; }
     BusResInfo info;
     core_state.info(name, info);
-    switch (info.kind) {
-        case BusValue::BOOL: macroPushBusValue(L, BusValue::bo(core_state.getBool(name))); break;
-        case BusValue::I32:  macroPushBusValue(L, BusValue::i32(core_state.getInt(name))); break;
-        case BusValue::ENUM: macroPushBusValue(L, BusValue::en(core_state.getInt(name))); break;
-        case BusValue::F32:  macroPushBusValue(L, BusValue::f32(core_state.getF32(name))); break;
-        case BusValue::STR:  macroPushBusValue(L, BusValue::str(core_state.getStr(name))); break;
-        case BusValue::TIME: macroPushBusValue(L, BusValue::tm(core_state.getTime(name))); break;
-        default: lua_pushnil(L); break;
-    }
+    if (info.isFunc && info.kind == BusValue::NONE) { lua_pushnil(L); return 1; }
+    macroPushStateValue(L, name, info);
     return 1;
 }
 
 static int macroLuaSet(lua_State* L) {
-    if (macroValidateNoSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
     const char* name = luaL_checkstring(L, 1);
     if (core_state.has(name) == false) { lua_pushinteger(L, BUS_ERR_NOT_FOUND); return 1; }
     BusResInfo info;
     core_state.info(name, info);
+
     BusValue v;
     if (lua_gettop(L) >= 2) { macroLuaToBusValue(L, 2, v); }
 
-    // ENUM: строку резолвим в индекс, числа отвергаем (BUS_ERR_BAD_VALUE).
     if (info.kind == BusValue::ENUM) {
-        BusValue rv;
-        String e;
-        if (macroResolveEnum(name, v, rv, e) != BUS_OK) {
-            lua_pushinteger(L, BUS_ERR_BAD_VALUE);
-            return 1;
-        }
-        v = rv;
+        if (lua_type(L, 2) != LUA_TSTRING) { lua_pushinteger(L, BUS_ERR_BAD_VALUE); return 1; }
+        int idx = core_state.enumIndexByName(name, lua_tostring(L, 2), nullptr);
+        if (idx < 0) { lua_pushinteger(L, BUS_ERR_BAD_VALUE); return 1; }
+        v = BusValue::en(idx);
     }
 
-    int rc = BUS_ERR_BAD_TYPE;
-    if (info.isFunc && !info.async) {
-        BusValue res;
-        rc = core_state.call(name, 1, &v, res);
-        lua_pushinteger(L, rc);
-        return 1;
-    }
-    switch (info.kind) {
-        case BusValue::BOOL: rc = core_state.setBool(name, (v.kind == BusValue::BOOL) ? v.b : (v.i != 0)); break;
-        case BusValue::I32:  rc = core_state.setInt(name, (int32_t)v.i); break;
-        case BusValue::ENUM: rc = core_state.setInt(name, (int32_t)v.i); break;
-        case BusValue::F32:  rc = core_state.setF32(name, v.f); break;
-        case BusValue::STR:  rc = core_state.setStr(name, v.s); break;
-        case BusValue::TIME: rc = core_state.setTime(name, v.t); break;
-        default: break;
-    }
-    lua_pushinteger(L, rc);
+    if (macroSuppressSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
+    lua_pushinteger(L, core_state.applyValue(name, v));
     return 1;
 }
 
 static int macroLuaCall(lua_State* L) {
-    if (macroValidateNoSideEffects) {
+    if (macroSuppressSideEffects) {
         lua_pushnil(L);
         lua_pushinteger(L, BUS_OK);
         return 2;
@@ -283,39 +723,30 @@ static int macroLuaCall(lua_State* L) {
         if (macroLuaToBusValue(L, 2 + i, args[argc])) { argc++; }
     }
 
-    // ENUM-функция (dual state+func, например wifi.mode): первый аргумент-строку
-    // резолвим в индекс; числа отвергаем.
     BusResInfo info;
     bool haveInfo = (core_state.info(name, info) == BUS_OK);
     if (haveInfo && argc >= 1 && info.kind == BusValue::ENUM) {
-        BusValue rv;
-        String e;
-        if (macroResolveEnum(name, args[0], rv, e) != BUS_OK) {
+        if (lua_type(L, 2) != LUA_TSTRING) {
             lua_pushnil(L);
             lua_pushinteger(L, BUS_ERR_BAD_VALUE);
             return 2;
         }
-        args[0] = rv;
+        int idx = core_state.enumIndexByName(name, lua_tostring(L, 2), nullptr);
+        if (idx < 0) {
+            lua_pushnil(L);
+            lua_pushinteger(L, BUS_ERR_BAD_VALUE);
+            return 2;
+        }
+        args[0] = BusValue::en(idx);
     }
 
-    // call на чистом state = set (идентично декларативному call/calls).
+    // call на чистом state = set.
     if (haveInfo && !info.isFunc && info.kind != BusValue::NONE) {
         BusValue v = (argc > 0) ? args[0] : BusValue();
-        int src = BUS_ERR_BAD_TYPE;
-        switch (info.kind) {
-            case BusValue::BOOL: src = core_state.setBool(name, (v.kind == BusValue::BOOL) ? v.b : (v.i != 0)); break;
-            case BusValue::I32:  src = core_state.setInt(name, (int32_t)v.i); break;
-            case BusValue::ENUM: src = core_state.setInt(name, (int32_t)v.i); break;
-            case BusValue::F32:  src = core_state.setF32(name, v.f); break;
-            case BusValue::STR:  src = core_state.setStr(name, v.s); break;
-            case BusValue::TIME: src = core_state.setTime(name, v.t); break;
-            default: break;
-        }
-        // Всегда (value, rc): успех тоже возвращает код, чтобы `v, rc = call(...)`
-        // давал rc без ветвления в сценарии.
+        int rc = core_state.applyValue(name, v);
         BusValue rv = core_state.valueToKind(v, info.kind);
         macroPushBusValue(L, rv);
-        lua_pushinteger(L, src);
+        lua_pushinteger(L, rc);
         return 2;
     }
 
@@ -340,8 +771,19 @@ static int macroLuaHas(lua_State* L) {
 static int macroLuaMode(lua_State* L) {
     const char* ns = luaL_checkstring(L, 1);
     if (lua_gettop(L) >= 2) {
-        if (macroValidateNoSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
-        int m = (int)luaL_checkinteger(L, 2);
+        if (macroSuppressSideEffects) { lua_pushinteger(L, BUS_OK); return 1; }
+        int m;
+        if (lua_type(L, 2) == LUA_TNUMBER) {
+            m = (int)lua_tointeger(L, 2);
+        } else if (lua_type(L, 2) == LUA_TSTRING) {
+            String full = String(ns) + ".mode";
+            int idx = core_state.enumIndexByName(full.c_str(), lua_tostring(L, 2), nullptr);
+            if (idx < 0) { lua_pushinteger(L, BUS_ERR_BAD_VALUE); return 1; }
+            m = idx;
+        } else {
+            lua_pushinteger(L, BUS_ERR_BAD_TYPE);
+            return 1;
+        }
         lua_pushinteger(L, core_state.mode(ns, m));
         return 1;
     }
@@ -416,498 +858,6 @@ static int macroLuaClock(lua_State* L) {
 }
 
 // ============================================================
-// Сериализация значений и аргументов
-// ============================================================
-
-static String macroValueToStr(lua_State* L, int idx) {
-    // lua_type, а не lua_isnumber: числовая строка ("0") должна остаться s:0 (STR),
-    // иначе STR-функции шины (wifi.set_slot) получают F32 и читают пустую строку.
-    int t = lua_type(L, idx);
-    if (t == LUA_TBOOLEAN) { return String(lua_toboolean(L, idx) ? "b:1" : "b:0"); }
-    if (t == LUA_TNUMBER) {
-        if (lua_isinteger(L, idx)) {
-            char b[24]; snprintf(b, sizeof(b), "i:%ld", (long)lua_tointeger(L, idx)); return String(b);
-        }
-        char b[32]; snprintf(b, sizeof(b), "f:%.4f", (double)lua_tonumber(L, idx)); return String(b);
-    }
-    if (t == LUA_TSTRING) { return String("s:") + String(lua_tostring(L, idx)); }
-    return String("s:");
-}
-
-static String macroArgsToStr(lua_State* L, int argsIdx) {
-    String out;
-    if (!lua_istable(L, argsIdx)) { return out; }
-    argsIdx = lua_absindex(L, argsIdx);
-    int n = (int)lua_rawlen(L, argsIdx);
-    for (int i = 1; i <= n; i++) {
-        lua_rawgeti(L, argsIdx, i);
-        if (i > 1) { out += '|'; }
-        out += macroValueToStr(L, -1);
-        lua_pop(L, 1);
-    }
-    return out;
-}
-
-static int macroStrToValue(const String& token, BusValue& out) {
-    if (token.startsWith("b:")) { out = BusValue::bo(token.charAt(2) == '1'); return 1; }
-    if (token.startsWith("i:")) { out = BusValue::i32((int32_t)token.substring(2).toInt()); return 1; }
-    if (token.startsWith("f:")) { out = BusValue::f32(token.substring(2).toFloat()); return 1; }
-    if (token.startsWith("s:")) { out = BusValue::str(token.substring(2)); return 1; }
-    out = BusValue::str(token);
-    return 1;
-}
-
-static int macroParseArgs(const String& s, BusValue* out, int max) {
-    int n = 0;
-    int start = 0;
-    while (n < max) {
-        int sep = s.indexOf('|', start);
-        String tok = (sep < 0) ? s.substring(start) : s.substring(start, sep);
-        if (tok.length() > 0) { macroStrToValue(tok, out[n]); n++; }
-        if (sep < 0) { break; }
-        start = sep + 1;
-        if (start > (int)s.length()) { break; }
-    }
-    return n;
-}
-
-static uint8_t macroOpCode(const char* s) {
-    if (s == NULL) { return MACRO_COND_EQ; }
-    if (!strcmp(s, "==") || !strcmp(s, "=")) { return MACRO_COND_EQ; }
-    if (!strcmp(s, "!=")) { return MACRO_COND_NE; }
-    if (!strcmp(s, "<"))  { return MACRO_COND_LT; }
-    if (!strcmp(s, "<=")) { return MACRO_COND_LE; }
-    if (!strcmp(s, ">"))  { return MACRO_COND_GT; }
-    if (!strcmp(s, ">=")) { return MACRO_COND_GE; }
-    if (!strcmp(s, "changed")) { return MACRO_COND_CHANGED; }
-    return MACRO_COND_EQ;
-}
-
-// Текстовое имя оператора cond (обратное к macroOpCode).
-const char* macroCondOpName(uint8_t op) {
-    switch (op) {
-        case MACRO_COND_EQ:      return "==";
-        case MACRO_COND_NE:      return "!=";
-        case MACRO_COND_LT:      return "<";
-        case MACRO_COND_LE:      return "<=";
-        case MACRO_COND_GT:      return ">";
-        case MACRO_COND_GE:      return ">=";
-        case MACRO_COND_CHANGED: return "changed";
-        default:                 return "?";
-    }
-}
-
-static const char* macroRuleTypeName(uint8_t type) {
-    switch (type) {
-        case MACRO_RULE_CRON:   return "cron";
-        case MACRO_RULE_COND:   return "cond";
-        case MACRO_RULE_TERM:   return "term";
-        case MACRO_RULE_BUTTON: return "button";
-        case MACRO_RULE_EVENT:  return "on";
-        default:                return "body";
-    }
-}
-
-// Внешний доступ к имени типа правила (для printList/логов).
-const char* macroRuleTypeStr(uint8_t type) {
-    return macroRuleTypeName(type);
-}
-
-// Отладочная сериализация cond-условий правила (собирается на месте).
-String macroRuleCondStr(const MacroRule& r) {
-    String out;
-    for (uint8_t i = 0; i < r.nConds; i++) {
-        if (i > 0) { out += ';'; }
-        out += r.conds[i].res;
-        out += '|';
-        out += macroCondOpName(r.conds[i].op);
-        if (r.conds[i].op != MACRO_COND_CHANGED) {
-            out += '|';
-            const BusValue& v = r.conds[i].val;
-            switch (v.kind) {
-                case BusValue::BOOL: out += (v.b ? "true" : "false"); break;
-                case BusValue::I32:  out += String((long)v.i); break;
-                case BusValue::ENUM: {
-                    const char* nm = core_state.enumNameByIndex(r.conds[i].res.c_str(), (int)v.i);
-                    if (nm != nullptr) { out += nm; } else { out += String((long)v.i); }
-                    break;
-                }
-                case BusValue::F32:  out += String(v.f); break;
-                case BusValue::STR:  out += v.s; break;
-                case BusValue::TIME: out += String((long)v.t); break;
-                default:             out += "-"; break;
-            }
-        }
-    }
-    return out;
-}
-
-// ============================================================
-// Чтение/сравнение ресурсов (декларативные условия)
-// ============================================================
-
-static bool macroReadRes(const String& name, BusValue& out) {
-    if (core_state.has(name.c_str()) == false) { return false; }
-    BusResInfo info;
-    core_state.info(name.c_str(), info);
-    switch (info.kind) {
-        case BusValue::BOOL: out = BusValue::bo(core_state.getBool(name.c_str())); break;
-        case BusValue::I32:  out = BusValue::i32(core_state.getInt(name.c_str())); break;
-        case BusValue::ENUM: out = BusValue::en(core_state.getInt(name.c_str())); break;
-        case BusValue::F32:  out = BusValue::f32(core_state.getF32(name.c_str())); break;
-        case BusValue::STR:  out = BusValue::str(core_state.getStr(name.c_str())); break;
-        case BusValue::TIME: out = BusValue::tm(core_state.getTime(name.c_str())); break;
-        default: return false;
-    }
-    return true;
-}
-
-static bool macroCompare(const BusValue& cur, uint8_t op, const BusValue& want) {
-    if (op == MACRO_COND_CHANGED) { return false; }
-
-    if (cur.kind == BusValue::STR || cur.kind == BusValue::NONE ||
-        want.kind == BusValue::STR || want.kind == BusValue::NONE) {
-        const char* a = (cur.kind == BusValue::STR) ? cur.s.c_str() : "";
-        const char* b = (want.kind == BusValue::STR) ? want.s.c_str() : "";
-        if (op == MACRO_COND_EQ) { return strcmp(a, b) == 0; }
-        if (op == MACRO_COND_NE) { return strcmp(a, b) != 0; }
-        return false;
-    }
-
-    double a = (cur.kind == BusValue::F32) ? (double)cur.f
-             : (cur.kind == BusValue::BOOL) ? (cur.b ? 1.0 : 0.0)
-             : (cur.kind == BusValue::TIME) ? (double)cur.t : (double)cur.i;
-    double b = (want.kind == BusValue::F32) ? (double)want.f
-             : (want.kind == BusValue::BOOL) ? (want.b ? 1.0 : 0.0)
-             : (want.kind == BusValue::TIME) ? (double)want.t : (double)want.i;
-    switch (op) {
-        case MACRO_COND_EQ: return a == b;
-        case MACRO_COND_NE: return a != b;
-        case MACRO_COND_LT: return a < b;
-        case MACRO_COND_LE: return a <= b;
-        case MACRO_COND_GT: return a > b;
-        case MACRO_COND_GE: return a >= b;
-        default: return false;
-    }
-}
-
-// ============================================================
-// Разбор таблицы сценария (новый формат)
-// ============================================================
-
-// Добавляет одно cond-условие из таблицы idx в структурный массив правила.
-static bool macroCondAddOne(lua_State* L, MacroFile& f, int idx, MacroRule& r) {
-    if (r.nConds >= MACRO_MAX_CONDS) { f.err = String("too many conds (max ") + String((unsigned)MACRO_MAX_CONDS) + ")"; return false; }
-    idx = lua_absindex(L, idx);
-
-    lua_getfield(L, idx, "res");
-    String res = lua_isstring(L, -1) ? String(lua_tostring(L, -1)) : String();
-    lua_pop(L, 1);
-    if (res.length() == 0) { f.err = "cond: res required"; return false; }
-
-    lua_getfield(L, idx, "op");
-    String op = lua_isstring(L, -1) ? String(lua_tostring(L, -1)) : String("==");
-    lua_pop(L, 1);
-    uint8_t opc = macroOpCode(op.c_str());
-
-    MacroCond& c = r.conds[r.nConds];
-    c.res = res;
-    c.op = opc;
-    c.val = BusValue();
-
-    if (opc != MACRO_COND_CHANGED) {
-        lua_getfield(L, idx, "val");
-        if (macroLuaToBusValue(L, lua_gettop(L), c.val) == false) {
-            if (lua_isstring(L, -1)) { c.val = BusValue::str(String(lua_tostring(L, -1))); }
-        }
-        lua_pop(L, 1);
-
-        // Best-effort: для уже зарегистрированного ENUM-ресурса резолвим значение
-        // при парсинге (ранняя диагностика); иначе — резолв при исполнении.
-        if (core_state.has(res.c_str())) {
-            BusResInfo info;
-            core_state.info(res.c_str(), info);
-            if (info.kind == BusValue::ENUM) {
-                BusValue rv;
-                String e;
-                if (macroResolveEnum(res.c_str(), c.val, rv, e) != BUS_OK) {
-                    f.err = e;
-                    return false;
-                }
-                c.val = rv;
-            }
-        }
-    }
-    r.nConds++;
-    return true;
-}
-
-// cond = {res=,op=,val=} либо { {..}, {..} } (AND), до MACRO_MAX_CONDS.
-static bool macroParseConds(lua_State* L, MacroFile& f, int condIdx, MacroRule& r) {
-    lua_getfield(L, condIdx, "res");
-    bool single = lua_isstring(L, -1);
-    lua_pop(L, 1);
-
-    if (single) { return macroCondAddOne(L, f, condIdx, r); }
-
-    int n = (int)lua_rawlen(L, condIdx);
-    for (int i = 1; i <= n; i++) {
-        lua_rawgeti(L, condIdx, i);
-        bool ok = false;
-        if (lua_istable(L, -1)) { ok = macroCondAddOne(L, f, lua_absindex(L, -1), r); }
-        lua_pop(L, 1);
-        if (!ok) { return false; }
-    }
-    return true;
-}
-
-// Разбирает одно правило таблицы в MacroRule. Возвращает true при успехе.
-static bool macroParseRule(lua_State* L, MacroFile& f, int tidx, MacroRule& r) {
-    tidx = lua_absindex(L, tidx);
-
-    r.type = MACRO_RULE_BODY;
-    r.spec = "";
-    r.next = 0;
-    r.lastCond = false;
-    r.nConds = 0;
-    for (uint8_t i = 0; i < MACRO_MAX_CONDS; i++) {
-        r.conds[i] = MacroCond();
-        r.lastVals[i] = "";
-        r.haveLast[i] = false;
-    }
-    r.setTarget = "";
-    r.setValue = BusValue();
-    r.handler = "";
-    r.handlerArgs = "";
-    r.nActions = 0;
-    r.sub = 0;
-    memset(&r.expr, 0, sizeof(r.expr));
-
-    // Триггеры допустимы только внутри when = {...} (плоский формат не поддерживается).
-    const char* trigs[] = { "cron", "cond", "term", "button", "on" };
-    for (uint8_t i = 0; i < 5; i++) {
-        lua_getfield(L, tidx, trigs[i]);
-        bool present = lua_isstring(L, -1) || lua_istable(L, -1);
-        lua_pop(L, 1);
-        if (present) {
-            f.err = "triggers must be inside when = {...}";
-            return false;
-        }
-    }
-
-    // --- when: составное условие (AND) ---
-    lua_getfield(L, tidx, "when");
-    if (lua_istable(L, -1)) {
-        int widx = lua_absindex(L, -1);
-
-        // Первичный триггер: максимум один из cron/term/button/on.
-        uint8_t primaries = 0;
-        lua_getfield(L, widx, "cron");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_CRON; r.spec = String(lua_tostring(L, -1)); primaries++; }
-        lua_pop(L, 1);
-        lua_getfield(L, widx, "term");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_TERM; r.spec = String(lua_tostring(L, -1)); primaries++; }
-        lua_pop(L, 1);
-        lua_getfield(L, widx, "button");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_BUTTON; r.spec = String(lua_tostring(L, -1)); primaries++; }
-        lua_pop(L, 1);
-        lua_getfield(L, widx, "on");
-        if (lua_isstring(L, -1)) { r.type = MACRO_RULE_EVENT; r.spec = String(lua_tostring(L, -1)); primaries++; }
-        lua_pop(L, 1);
-
-        if (primaries > 1) {
-            lua_pop(L, 1);
-            f.err = "when: at most one of cron/term/button/on";
-            return false;
-        }
-
-        // Проверочные cond-условия (0..MACRO_MAX_CONDS).
-        lua_getfield(L, widx, "cond");
-        if (lua_istable(L, -1)) {
-            bool ok = macroParseConds(L, f, lua_absindex(L, -1), r);
-            lua_pop(L, 1);
-            if (!ok) { lua_pop(L, 1); return false; }
-        } else {
-            lua_pop(L, 1);
-        }
-    }
-    lua_pop(L, 1);
-
-    // Только cond-условия без первичного триггера — правило-наблюдатель (фронт).
-    if (r.type == MACRO_RULE_BODY && r.nConds > 0) { r.type = MACRO_RULE_COND; }
-
-    // Разбор cron-выражения первичного триггера.
-    if (r.type == MACRO_RULE_CRON) {
-        const char* perr = NULL;
-        cron_parse_expr(r.spec.c_str(), &r.expr, &perr);
-        if (perr) { f.err = String("cron error: ") + perr; return false; }
-    }
-
-    // --- действие: ровно одно из run/call/calls/set ---
-    uint8_t nAct = 0;
-    uint8_t actKind = 0;   // 1=run, 2=call, 3=calls, 4=set
-
-    lua_getfield(L, tidx, "run");
-    if (lua_isstring(L, -1)) { actKind = 1; nAct++; r.handler = String(lua_tostring(L, -1)); }
-    lua_pop(L, 1);
-
-    lua_getfield(L, tidx, "call");
-    if (lua_isstring(L, -1)) { actKind = 2; nAct++; }
-    lua_pop(L, 1);
-
-    lua_getfield(L, tidx, "calls");
-    if (lua_istable(L, -1)) { actKind = 3; nAct++; }
-    lua_pop(L, 1);
-
-    lua_getfield(L, tidx, "set");
-    if (lua_isstring(L, -1)) { actKind = 4; nAct++; }
-    lua_pop(L, 1);
-
-    if (nAct == 0) {
-        f.err = String("rule has no action (set/call/calls/run): ") + macroRuleTypeName(r.type);
-        return false;
-    }
-    if (nAct > 1) { f.err = "rule has multiple actions"; return false; }
-
-    if (actKind == 1) {
-        lua_getfield(L, tidx, "args");
-        if (lua_istable(L, -1)) { r.handlerArgs = macroArgsToStr(L, lua_absindex(L, -1)); }
-        lua_pop(L, 1);
-        return true;
-    }
-
-    if (actKind == 4) {
-        lua_getfield(L, tidx, "set");
-        r.setTarget = String(lua_tostring(L, -1));
-        lua_pop(L, 1);
-
-        lua_getfield(L, tidx, "value");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-            f.err = "set: value required";
-            return false;
-        }
-        bool ok = macroLuaToBusValue(L, lua_gettop(L), r.setValue);
-        lua_pop(L, 1);
-        if (!ok) { f.err = "set: bad value"; return false; }
-
-        // Проверка ресурса (best-effort): чистая функция/событие — не значение.
-        if (core_state.has(r.setTarget.c_str())) {
-            BusResInfo info;
-            core_state.info(r.setTarget.c_str(), info);
-            if (info.kind == BusValue::NONE) {
-                f.err = String("set: use call= for function resource ") + r.setTarget;
-                return false;
-            }
-            if (info.kind == BusValue::ENUM) {
-                BusValue rv;
-                String e;
-                if (macroResolveEnum(r.setTarget.c_str(), r.setValue, rv, e) != BUS_OK) {
-                    f.err = e;
-                    return false;
-                }
-                r.setValue = rv;
-            }
-        }
-        return true;
-    }
-
-    if (actKind == 3) {
-        // calls = { {name=,args=}, ... } либо { {"name", {args}}, ... }
-        lua_getfield(L, tidx, "calls");
-        int cidx = lua_absindex(L, -1);
-        int n = (int)lua_rawlen(L, cidx);
-        if (n > MACRO_MAX_ACTIONS) {
-            lua_pop(L, 1);
-            f.err = String("too many calls (max ") + String((unsigned)MACRO_MAX_ACTIONS) + ")";
-            return false;
-        }
-        for (int i = 1; i <= n && r.nActions < MACRO_MAX_ACTIONS; i++) {
-            lua_rawgeti(L, cidx, i);
-            if (lua_istable(L, -1)) {
-                int eidx = lua_absindex(L, -1);
-                String name;
-                String args;
-                lua_getfield(L, eidx, "name");
-                if (lua_isstring(L, -1)) { name = String(lua_tostring(L, -1)); }
-                lua_pop(L, 1);
-                lua_getfield(L, eidx, "args");
-                if (lua_istable(L, -1)) { args = macroArgsToStr(L, lua_absindex(L, -1)); }
-                lua_pop(L, 1);
-                if (name.length() == 0) {
-                    // Форма {"name", {args}}
-                    lua_rawgeti(L, eidx, 1);
-                    if (lua_isstring(L, -1)) { name = String(lua_tostring(L, -1)); }
-                    lua_pop(L, 1);
-                    lua_rawgeti(L, eidx, 2);
-                    if (lua_istable(L, -1)) { args = macroArgsToStr(L, lua_absindex(L, -1)); }
-                    lua_pop(L, 1);
-                }
-                if (name.length() > 0) {
-                    // Best-effort (только диагностика): числовой/невалидный ENUM-аргумент
-                    // отсекаем при парсинге; r.actions[] не трогаем (резолв при исполнении).
-                    if (args.length() > 0 && core_state.has(name.c_str())) {
-                        BusResInfo info;
-                        core_state.info(name.c_str(), info);
-                        if (info.kind == BusValue::ENUM) {
-                            BusValue av[MACRO_CALL_MAX_ARGS];
-                            int an = macroParseArgs(args, av, MACRO_CALL_MAX_ARGS);
-                            if (an > 0) {
-                                BusValue rv;
-                                String e;
-                                if (macroResolveEnum(name.c_str(), av[0], rv, e) != BUS_OK) {
-                                    lua_pop(L, 2);
-                                    f.err = e;
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                    String act = name;
-                    if (args.length() > 0) { act += '|'; act += args; }
-                    r.actions[r.nActions++] = act;
-                }
-            }
-            lua_pop(L, 1);
-        }
-        lua_pop(L, 1);
-        if (r.nActions == 0) { f.err = "calls: empty"; return false; }
-        return true;
-    }
-
-    // actKind == 2: одиночный call = "ns.func"
-    lua_getfield(L, tidx, "call");
-    String cname = String(lua_tostring(L, -1));
-    lua_pop(L, 1);
-    lua_getfield(L, tidx, "args");
-    String cargs;
-    if (lua_istable(L, -1)) { cargs = macroArgsToStr(L, lua_absindex(L, -1)); }
-    lua_pop(L, 1);
-
-    // Best-effort (только диагностика): невалидный ENUM-аргумент — ошибка правила.
-    if (cargs.length() > 0 && core_state.has(cname.c_str())) {
-        BusResInfo info;
-        core_state.info(cname.c_str(), info);
-        if (info.kind == BusValue::ENUM) {
-            BusValue av[MACRO_CALL_MAX_ARGS];
-            int an = macroParseArgs(cargs, av, MACRO_CALL_MAX_ARGS);
-            if (an > 0) {
-                BusValue rv;
-                String e;
-                if (macroResolveEnum(cname.c_str(), av[0], rv, e) != BUS_OK) {
-                    f.err = e;
-                    return false;
-                }
-            }
-        }
-    }
-    String act = cname;
-    if (cargs.length() > 0) { act += '|'; act += cargs; }
-    r.actions[r.nActions++] = act;
-    return true;
-}
-
-// ============================================================
 // Методы класса (движок «барабана»)
 // ============================================================
 
@@ -922,18 +872,7 @@ bool CLASS_MODULE_MACROS::initLua() {
         DEBUGMACROS("initLua: no memory for interpreter\r\n");
         return false;
     }
-    bool reg =
-        _lua->registerFunction("get",   macroLuaGet)  &&
-        _lua->registerFunction("set",   macroLuaSet)  &&
-        _lua->registerFunction("call",  macroLuaCall) &&
-        _lua->registerFunction("has",   macroLuaHas)  &&
-        _lua->registerFunction("mode",  macroLuaMode) &&
-        _lua->registerFunction("info",  macroLuaInfo) &&
-        _lua->registerFunction("puts",  macroLuaPuts) &&
-        _lua->registerFunction("print", macroLuaPuts) &&
-        _lua->registerFunction("clock", macroLuaClock)&&
-        _lua->registerFunction("now",   macroLuaNow);
-    if (reg == false) {
+    if (macroRegisterHelpers(*_lua) == false) {
         DEBUGMACROS("initLua: register failed\r\n");
         delete _lua;
         _lua = NULL;
@@ -945,15 +884,40 @@ bool CLASS_MODULE_MACROS::initLua() {
     return true;
 }
 
-/** Освобождает правила файла и снимает неиспользуемые подписки. */
+// Регистрирует глобальные функции сценария на интерпретаторе. Используется как
+// для единого _lua, так и для изолированного движка валидации (веб-задача).
+bool macroRegisterHelpers(EspLuaEngine& eng) {
+    return
+        eng.registerFunction("every",  macroLuaEvery)  &&
+        eng.registerFunction("after",  macroLuaAfter)  &&
+        eng.registerFunction("once",   macroLuaOnce)   &&
+        eng.registerFunction("tick",   macroLuaTick)   &&
+        eng.registerFunction("on",     macroLuaOn)     &&
+        eng.registerFunction("term",   macroLuaTerm)   &&
+        eng.registerFunction("button", macroLuaButton) &&
+        eng.registerFunction("meta",   macroLuaMeta)   &&
+        eng.registerFunction("get",    macroLuaGet)    &&
+        eng.registerFunction("set",    macroLuaSet)    &&
+        eng.registerFunction("call",   macroLuaCall)   &&
+        eng.registerFunction("has",    macroLuaHas)    &&
+        eng.registerFunction("mode",   macroLuaMode)   &&
+        eng.registerFunction("info",   macroLuaInfo)   &&
+        eng.registerFunction("puts",   macroLuaPuts)   &&
+        eng.registerFunction("print",  macroLuaPuts)   &&
+        eng.registerFunction("log",    macroLuaPuts)   &&
+        eng.registerFunction("clock",  macroLuaClock)  &&
+        eng.registerFunction("now",    macroLuaNow);
+}
+
+/** Освобождает runtime файла (refs, обработчики) и снимает неиспользуемые подписки. */
 void CLASS_MODULE_MACROS::unregisterFile(MacroFile& f) {
-    if (f.rules != NULL) { delete[] f.rules; f.rules = NULL; }
-    f.nRules = 0;
+    lua_State* L = (_lua != NULL) ? _lua->getLuaState() : NULL;
+    macroFreeRuntime(L, f);
     f.active = false;
     pruneEventSubs();
 }
 
-/** Регистрирует файл: читает его, разбирает rules в «барабане» и закрывает. */
+/** Регистрирует файл: компилирует чанк (однажды) и создаёт окружение/state. */
 bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
     f.err = "";
     f.desc = "";
@@ -980,226 +944,90 @@ bool CLASS_MODULE_MACROS::registerFile(MacroFile& f) {
     }
 
     lua_State* L = _lua->getLuaState();
-    int status = macroLoadChunk(L, f, content);
-    if (status != LUA_OK) {
-        if (f.err.length() == 0) { f.err = "Scenario parse error"; }
+    if (macroCompileChunk(L, f, content) != LUA_OK) {
         DEBUGMACROS("%s: %s -> %s\r\n", __FUNCTION__, f.name.c_str(), f.err.c_str());
         return false;
     }
 
-    if (!lua_istable(L, -1)) {
-        f.err = "legacy/invalid format: expected table {handlers,rules}";
-        DEBUGMACROS("%s: %s\r\n", __FUNCTION__, f.err.c_str());
-        lua_settop(L, 0);
-        return false;
-    }
-    int tbl = lua_absindex(L, -1);
-
-    lua_getfield(L, tbl, "desc");
-    if (lua_isstring(L, -1)) { f.desc = String(lua_tostring(L, -1)); }
-    lua_pop(L, 1);
-
-    lua_getfield(L, tbl, "meta_cron");
-    if (lua_isstring(L, -1)) { f.metaCron = String(lua_tostring(L, -1)); }
-    else { f.metaCron = ""; }
-    lua_pop(L, 1);
-
-    lua_getfield(L, tbl, "rules");
-    if (!lua_istable(L, -1)) {
-        f.err = "no rules table";
-        DEBUGMACROS("%s: %s\r\n", __FUNCTION__, f.err.c_str());
-        lua_settop(L, 0);
-        return false;
-    }
-    int rt = lua_absindex(L, -1);
-    int n = (int)lua_rawlen(L, rt);
-    if (n <= 0) {
-        f.err = "no rules";
-        lua_settop(L, 0);
-        return false;
-    }
-    if (n > MACRO_MAX_RULES) {
-        f.err = String("too many rules (max ") + String((unsigned)MACRO_MAX_RULES) + ")";
-        DEBUGMACROS("%s: %s\r\n", __FUNCTION__, f.err.c_str());
-        lua_settop(L, 0);
-        return false;
-    }
-
-    f.rules = new (std::nothrow) MacroRule[n];
-    if (f.rules == NULL) {
-        f.err = "No memory for rules";
+    f.handlers = new (std::nothrow) MacroHandler[MACRO_MAX_HANDLERS];
+    if (f.handlers == NULL) {
+        f.err = "No memory for handlers";
         f.parseFails++;
         if (f.parseFails < MACRO_PARSE_MAX_RETRY) { f.needParse = true; }
-        lua_settop(L, 0);
+        macroFreeRuntime(L, f);
         return false;
     }
-    f.nRules = 0;
-
-    for (int i = 1; i <= n; i++) {
-        lua_rawgeti(L, rt, i);
-        if (lua_istable(L, -1)) {
-            MacroRule& r = f.rules[f.nRules];
-            if (macroParseRule(L, f, lua_absindex(L, -1), r)) {
-                f.nRules++;
-            } else {
-                DEBUGMACROS("%s: %s rule %d: %s\r\n", __FUNCTION__, f.name.c_str(), i, f.err.c_str());
-                break;
-            }
-        }
-        lua_pop(L, 1);
-    }
-    lua_settop(L, 0);
-
-    if (f.nRules == 0) {
-        if (f.err.length() == 0) { f.err = "no valid rules"; }
-        unregisterFile(f);
-        return false;
-    }
-
-    // Мета-cron (гейт окна). Невалидный cron → скрипт не исполняется.
-    f.metaValid = true;
-    f.metaInit = false;
-    f.metaNext = 0;
-    memset(&f.metaExpr, 0, sizeof(f.metaExpr));
-    if (f.metaCron.length() > 0) {
-        const char* perr = NULL;
-        cron_parse_expr(f.metaCron.c_str(), &f.metaExpr, &perr);
-        if (perr) {
-            f.metaValid = false;
-            f.err = "cron error";
-            unregisterFile(f);
-            return false;
-        }
-    }
-
-    // Подписки на события шины
-    for (uint8_t i = 0; i < f.nRules; i++) {
-        if (f.rules[i].type == MACRO_RULE_EVENT) { ensureEventSub(f.rules[i].spec); }
-    }
+    f.nHandlers = 0;
 
     f.active = true;
     f.parseFails = 0;
-    DEBUGMACROS("%s: %s -> %d rules (heap %u)\r\n", __FUNCTION__, f.name.c_str(), f.nRules, macroHeapFree());
+    DEBUGMACROS("%s: %s ok (heap %u)\r\n", __FUNCTION__, f.name.c_str(), macroHeapFree());
     return true;
 }
 
-/** Валидирует сценарий без регистрации файла: синтаксис, meta_cron и rules. */
-bool macroValidateScenario(EspLuaEngine& eng, const String& content, String& err) {
+/** Валидирует сценарий: компиляция + пробный прогон тела (без побочных действий). */
+bool macroValidateScript(EspLuaEngine& eng, const String& content, String& err) {
     err = "";
     lua_State* L = eng.getLuaState();
     if (L == NULL) { err = "No interpreter"; return false; }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { err = "low memory"; return false; }
 
     MacroFile tf;
     tf.name = "@validate";
-    // На время исполнения top-level отключаем побочные bus-действия.
-    macroValidateNoSideEffects = true;
-    int status = macroLoadChunk(L, tf, content);
-    macroValidateNoSideEffects = false;
-    if (status != LUA_OK) {
-        err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error");
-        lua_settop(L, 0);
-        return false;
-    }
-    if (!lua_istable(L, -1)) {
-        err = "legacy/invalid format: expected table {handlers,rules}";
-        lua_settop(L, 0);
-        return false;
-    }
-    int tbl = lua_absindex(L, -1);
+    tf.chunkRef = tf.envRef = tf.stateRef = LUA_NOREF;
+    tf.handlers = NULL;
+    tf.nHandlers = 0;
+    tf.err = "";
 
-    lua_getfield(L, tbl, "meta_cron");
-    String metaCron;
-    if (lua_isstring(L, -1)) { metaCron = String(lua_tostring(L, -1)); }
-    lua_pop(L, 1);
-    if (metaCron.length() > 0) {
-        cron_expr metaExpr;
-        memset(&metaExpr, 0, sizeof(metaExpr));
-        const char* perr = NULL;
-        cron_parse_expr(metaCron.c_str(), &metaExpr, &perr);
-        if (perr) {
-            err = String("meta_cron: ") + perr;
-            lua_settop(L, 0);
-            return false;
-        }
+    macroSuppressSideEffects = true;
+    int status = macroCompileChunk(L, tf, content);
+    if (status == LUA_OK) {
+        macroRunBody(L, tf);
+        if (tf.err.length() > 0) { status = LUA_ERRRUN; }
     }
+    macroSuppressSideEffects = false;
 
-    lua_getfield(L, tbl, "rules");
-    if (!lua_istable(L, -1)) {
-        err = "no rules table";
-        lua_settop(L, 0);
-        return false;
-    }
-    int rt = lua_absindex(L, -1);
-    int n = (int)lua_rawlen(L, rt);
-    if (n <= 0) {
-        err = "no rules";
-        lua_settop(L, 0);
-        return false;
-    }
-    if (n > MACRO_MAX_RULES) {
-        err = String("too many rules (max ") + String((unsigned)MACRO_MAX_RULES) + ")";
-        lua_settop(L, 0);
-        return false;
-    }
+    bool ok = (status == LUA_OK);
+    if (!ok) { err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error"); }
 
-    for (int i = 1; i <= n; i++) {
-        lua_rawgeti(L, rt, i);
-        if (lua_istable(L, -1)) {
-            MacroRule r;
-            if (macroParseRule(L, tf, lua_absindex(L, -1), r) == false) {
-                err = (tf.err.length() > 0) ? tf.err : String("rule ") + String(i) + ": invalid";
-                lua_settop(L, 0);
-                return false;
-            }
-        }
-        lua_pop(L, 1);
-    }
+    macroFreeRuntime(L, tf);
     lua_settop(L, 0);
-    return true;
+    return ok;
 }
 
-/** Читает только desc/meta_cron сценария (без разбора rules). */
+/** Читает только desc из meta{} без запуска живого файла (изолированная песочница). */
 bool macroReadScenarioMeta(EspLuaEngine& eng, const String& content,
-                           String& desc, String& metaCron, String& err) {
+                           String& desc, String& err) {
     desc = "";
-    metaCron = "";
     err = "";
     lua_State* L = eng.getLuaState();
     if (L == NULL) { err = "No interpreter"; return false; }
+    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { err = "low memory"; return false; }
 
     MacroFile tf;
     tf.name = "@meta";
-    // На время исполнения top-level отключаем побочные bus-действия.
-    macroValidateNoSideEffects = true;
-    int status = macroLoadChunk(L, tf, content);
-    macroValidateNoSideEffects = false;
-    if (status != LUA_OK) {
-        err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error");
-        lua_settop(L, 0);
-        return false;
-    }
-    if (!lua_istable(L, -1)) {
-        err = "legacy/invalid format: expected table {handlers,rules}";
-        lua_settop(L, 0);
-        return false;
-    }
-    int tbl = lua_absindex(L, -1);
+    tf.chunkRef = tf.envRef = tf.stateRef = LUA_NOREF;
+    tf.handlers = NULL;
+    tf.nHandlers = 0;
+    tf.err = "";
 
-    lua_getfield(L, tbl, "desc");
-    if (lua_isstring(L, -1)) { desc = String(lua_tostring(L, -1)); }
-    lua_pop(L, 1);
+    macroSuppressSideEffects = true;
+    int status = macroCompileChunk(L, tf, content);
+    if (status == LUA_OK) { macroRunBody(L, tf); }
+    macroSuppressSideEffects = false;
 
-    lua_getfield(L, tbl, "meta_cron");
-    if (lua_isstring(L, -1)) { metaCron = String(lua_tostring(L, -1)); }
-    lua_pop(L, 1);
+    desc = tf.desc;
+    bool ok = (status == LUA_OK && tf.err.length() == 0);
+    if (!ok) { err = (tf.err.length() > 0) ? tf.err : String("Scenario parse error"); }
 
+    macroFreeRuntime(L, tf);
     lua_settop(L, 0);
-    return true;
+    return ok;
 }
 
-/** Заполняет desc/meta_cron остановленного файла (без разбора правил). */
+/** Заполняет desc остановленного файла (без запуска живого сценария). */
 void CLASS_MODULE_MACROS::refreshFileMeta(MacroFile& f) {
-    if (f.active) { return; }                 // активный уже заполнен registerFile
+    if (f.active) { return; }
     if (_fs == NULL || _fs->exists(f.name) == false) { return; }
     if (initLua() == false) { return; }
     if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { return; }
@@ -1207,22 +1035,17 @@ void CLASS_MODULE_MACROS::refreshFileMeta(MacroFile& f) {
     String content = readFile(f.name);
     if (content.length() == 0) { return; }
 
-    String desc, cron, err;
-    if (macroReadScenarioMeta(*_lua, content, desc, cron, err)) {
-        f.desc = desc;
-        f.metaCron = cron;
-    }
+    String desc, err;
+    if (macroReadScenarioMeta(*_lua, content, desc, err)) { f.desc = desc; }
 }
 
-/** Пере(регистрирует) только помеченные файлы (needParse), не более N за тик. */
+/** Пере(компилирует) только помеченные файлы (needParse), не более N за тик. */
 void CLASS_MODULE_MACROS::rebuildScripts() {
     uint8_t done = 0;
     for (uint8_t i = 0; i < _fileCount; i++) {
         MacroFile& f = _files[i];
         if (f.run == false) {
             if (f.active) { unregisterFile(f); }
-            // Остановленный файл: при пометке обновляем только desc/meta_cron
-            // (для веб-таблицы), правила не разбираем.
             if (f.needParse) { refreshFileMeta(f); f.needParse = false; }
             continue;
         }
@@ -1247,236 +1070,6 @@ bool CLASS_MODULE_MACROS::anyNeedParse() {
 }
 
 // ============================================================
-// Выполнение правил
-// ============================================================
-
-static void macroPushEventTable(lua_State* L, MacroRule& r, const BusValue* value) {
-    lua_newtable(L);
-    lua_pushstring(L, macroRuleTypeName(r.type));
-    lua_setfield(L, -2, "type");
-    lua_pushstring(L, r.spec.c_str());
-    lua_setfield(L, -2, "spec");
-    if (value != NULL) {
-        macroPushBusValue(L, *value);
-        lua_setfield(L, -2, "value");
-    }
-    BusValue av[MACRO_CALL_MAX_ARGS];
-    int n = macroParseArgs(r.handlerArgs, av, MACRO_CALL_MAX_ARGS);
-    lua_newtable(L);
-    for (int i = 0; i < n; i++) {
-        macroPushBusValue(L, av[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    lua_setfield(L, -2, "args");
-}
-
-// Обёртка для ПРОТЕКТИРОВАННОГО построения таблицы события: вызывается под
-// lua_pcall (аллокации tabla вне защиты → abort()). Правило передаётся upvalue.
-static int macroPushEventClosure(lua_State* L) {
-    MacroRule* r = (MacroRule*)lua_touserdata(L, lua_upvalueindex(1));
-    if (r == NULL) { lua_pushnil(L); return 1; }
-    macroPushEventTable(L, *r, nullptr);
-    return 1;
-}
-
-/** Исполняет named-handler: перечитывает файл, компилирует и вызывает функция. */
-String CLASS_MODULE_MACROS::runHandler(MacroFile& f, MacroRule& r) {
-    if (_lua == NULL) { return "No interpreter"; }
-    if (macroHeapFree() < MACRO_LUA_MIN_HEAP) { return "low memory"; }
-
-    String content = readFile(f.name);
-    if (content.length() == 0) { return "File is empty or unreadable"; }
-
-    lua_State* L = _lua->getLuaState();
-    int status = macroLoadChunk(L, f, content);
-    if (status != LUA_OK) {
-        return (f.err.length() > 0) ? f.err : String("Scenario parse error");
-    }
-    if (!lua_istable(L, -1)) { lua_settop(L, 0); return "handler: no table"; }
-    int tbl = lua_absindex(L, -1);
-
-    lua_getfield(L, tbl, "handlers");
-    if (!lua_istable(L, -1)) { lua_settop(L, 0); return "handler: no handlers"; }
-
-    lua_getfield(L, -1, r.handler.c_str());
-    if (!lua_isfunction(L, -1)) { lua_settop(L, 0); return String("handler not found: ") + r.handler; }
-
-    // Таблицу события строим в защищённом вызове (стек: [handler] -> [handler, event]).
-    lua_pushlightuserdata(L, &r);
-    lua_pushcclosure(L, macroPushEventClosure, 1);
-    status = lua_pcall(L, 0, 1, 0);
-    if (status != LUA_OK) {
-        String err = macroLuaPopError(L);
-        lua_settop(L, 0);
-        return (err.length() > 0) ? err : String("event table error");
-    }
-
-    macroLuaSteps = 0;
-    lua_sethook(L, macroLuaHook, LUA_MASKCOUNT, MACRO_LUA_HOOK_N);
-    status = lua_pcall(L, 1, 0, 0);
-    lua_sethook(L, NULL, 0, 0);
-
-    String err;
-    if (status != LUA_OK) {
-        err = macroLuaPopError(L);
-        if (err.length() == 0) { err = "handler error"; }
-    }
-    lua_settop(L, 0);
-    return err;
-}
-
-/** Исполняет действие правила: set-запись либо декларативные bus-вызовы. */
-static void macroRunActions(MacroFile& f, MacroRule& r) {
-    if (r.setTarget.length() > 0) {
-        BusResInfo info;
-        int rc = BUS_ERR_NOT_FOUND;
-        if (core_state.info(r.setTarget.c_str(), info) == BUS_OK) {
-            // Обязательный резолв ENUM с актуальным info (поздняя регистрация ресурса):
-            // строку приводим к индексу, числа отвергаем — до ветвления isFunc/state.
-            BusValue val = r.setValue;
-            if (info.kind == BusValue::ENUM) {
-                String e;
-                if (macroResolveEnum(r.setTarget.c_str(), val, val, e) != BUS_OK) {
-                    f.err = e;
-                    return;
-                }
-            }
-            if (info.isFunc && !info.async) {
-                // dual state+func: применяем значение через write-функцию
-                BusValue res;
-                rc = core_state.call(r.setTarget.c_str(), 1, &val, res);
-                (void)res;   // результат write-функции не используется
-            } else if (info.kind != BusValue::NONE) {
-                // чистое состояние: коэрсим значение и обновляем реестр
-                BusValue coerced = core_state.valueToKind(val, info.kind);
-                switch (info.kind) {
-                    case BusValue::BOOL: rc = core_state.setBool(r.setTarget.c_str(), coerced.b); break;
-                    case BusValue::I32:  rc = core_state.setInt(r.setTarget.c_str(), coerced.i); break;
-                    case BusValue::ENUM: rc = core_state.setInt(r.setTarget.c_str(), coerced.i); break;
-                    case BusValue::F32:  rc = core_state.setF32(r.setTarget.c_str(), coerced.f); break;
-                    case BusValue::STR:  rc = core_state.setStr(r.setTarget.c_str(), coerced.s); break;
-                    case BusValue::TIME: rc = core_state.setTime(r.setTarget.c_str(), coerced.t); break;
-                    default: break;
-                }
-            }
-        }
-        if (rc != BUS_OK) {
-            f.err = String("set ") + r.setTarget + " " + ns_core_state::busErrStr(rc);
-        }
-        return;
-    }
-
-    for (uint8_t a = 0; a < r.nActions; a++) {
-        String act = r.actions[a];
-        int sep = act.indexOf('|');
-        String name = (sep < 0) ? act : act.substring(0, sep);
-        String args = (sep < 0) ? String() : act.substring(sep + 1);
-
-        BusValue av[MACRO_CALL_MAX_ARGS];
-        int argc = macroParseArgs(args, av, MACRO_CALL_MAX_ARGS);
-
-        if (core_state.has(name.c_str()) == false) {
-            f.err = String("call: not found ") + name;
-            continue;
-        }
-        BusResInfo info;
-        core_state.info(name.c_str(), info);
-
-        // Обязательный резолв ENUM-аргумента до ветвления isFunc/state.
-        if (info.kind == BusValue::ENUM && argc > 0) {
-            BusValue rv;
-            String e;
-            if (macroResolveEnum(name.c_str(), av[0], rv, e) != BUS_OK) {
-                f.err = e;
-                continue;
-            }
-            av[0] = rv;
-        }
-
-        int rc = BUS_ERR_BAD_TYPE;
-        if (info.isFunc && !info.async) {
-            BusValue res;
-            rc = core_state.call(name.c_str(), argc, (argc > 0) ? av : nullptr, res);
-        } else if (info.isFunc && info.async) {
-            rc = core_state.call_async(name.c_str(), macroNoopCb, nullptr, argc, (argc > 0) ? av : nullptr);
-        } else {
-            BusValue v = (argc > 0) ? av[0] : BusValue();
-            BusValue coerced = core_state.valueToKind(v, info.kind);
-            switch (info.kind) {
-                case BusValue::BOOL: rc = core_state.setBool(name.c_str(), coerced.b); break;
-                case BusValue::I32:  rc = core_state.setInt(name.c_str(), coerced.i); break;
-                case BusValue::ENUM: rc = core_state.setInt(name.c_str(), coerced.i); break;
-                case BusValue::F32:  rc = core_state.setF32(name.c_str(), coerced.f); break;
-                case BusValue::STR:  rc = core_state.setStr(name.c_str(), coerced.s); break;
-                case BusValue::TIME: rc = core_state.setTime(name.c_str(), coerced.t); break;
-                default: break;
-            }
-        }
-        if (rc != BUS_OK) {
-            f.err = String("call ") + name + " " + ns_core_state::busErrStr(rc);
-        }
-    }
-}
-
-void CLASS_MODULE_MACROS::fireRule(MacroFile& f, MacroRule& r) {
-    // Единый лог срабатывания правила (все типы: cron/cond/term/button/on/body).
-    DEBUGMACROS("[MACRO] %s fired %s(%s)\r\n", f.name.c_str(), macroRuleTypeName(r.type),
-                (r.type == MACRO_RULE_COND) ? macroRuleCondStr(r).c_str() : r.spec.c_str());
-    if (r.handler.length() > 0) {
-        String err = runHandler(f, r);
-        if (err.length() > 0) {
-            f.err = err;
-            DEBUGMACROS("[MACRO] %s exec error: %s\r\n", f.name.c_str(), err.c_str());
-        }
-        return;
-    }
-    macroRunActions(f, r);
-}
-
-/** Вычисляет составное условие правила (AND по структурному массиву conds[]). */
-bool CLASS_MODULE_MACROS::evalConds(MacroFile& f, MacroRule& r, String& errTxt) {
-    (void)f;
-    errTxt = "";
-    bool all = true;
-
-    for (uint8_t i = 0; i < r.nConds; i++) {
-        MacroCond& c = r.conds[i];
-        BusValue cur;
-        if (macroReadRes(c.res, cur) == false) {
-            // При ошибке чтения lastVals/haveLast НЕ обновляем:
-            // changed должен сработать, когда ресурс снова станет доступен.
-            errTxt = String("cond: not found ") + c.res;
-            return false;
-        }
-
-        if (c.op == MACRO_COND_CHANGED) {
-            String curStr = (cur.kind == BusValue::STR) ? String("s:") + cur.s
-                          : (cur.kind == BusValue::BOOL) ? String(cur.b ? "b:1" : "b:0")
-                          : (cur.kind == BusValue::F32) ? String("f:") + String(cur.f)
-                          : (cur.kind == BusValue::TIME) ? String("t:") + String((long)cur.t)
-                          : String("i:") + String((long)cur.i);
-            bool changed = r.haveLast[i] && (curStr != r.lastVals[i]);
-            r.lastVals[i] = curStr;
-            r.haveLast[i] = true;
-            if (!changed) { all = false; }
-        } else {
-            // Резолв ENUM-значения cond (обязательный: ресурс мог зарегистрироваться
-            // после парсинга). Числовые значения для ENUM отвергаются.
-            BusValue want = c.val;
-            if (cur.kind == BusValue::ENUM) {
-                String e;
-                if (macroResolveEnum(c.res.c_str(), c.val, want, e) != BUS_OK) {
-                    errTxt = e;
-                    return false;
-                }
-            }
-            if (macroCompare(cur, c.op, want) == false) { all = false; }
-        }
-    }
-    return all;
-}
-
-// ============================================================
 // Подписки на события шины
 // ============================================================
 
@@ -1488,7 +1081,8 @@ static int macroNoopCb(void* user, int argc, const BusValue* argv, BusValue& res
 static int macroEventTramp(void* user, int argc, const BusValue* argv, BusValue& result) {
     (void)user; (void)result;
     if (argc < 1) { return BUS_ERR_BAD_ARGC; }
-    module_macros.fireToken(MACRO_RULE_EVENT, argv[0].s);
+    BusValue v = (argc >= 2) ? argv[1] : BusValue();
+    module_macros.fireToken(MACRO_H_ON, argv[0].s, v);
     return BUS_OK;
 }
 
@@ -1509,9 +1103,9 @@ void CLASS_MODULE_MACROS::pruneEventSubs() {
         bool used = false;
         for (uint8_t fi = 0; fi < _fileCount && !used; fi++) {
             MacroFile& f = _files[fi];
-            if (f.active == false || f.rules == NULL) { continue; }
-            for (uint8_t ri = 0; ri < f.nRules; ri++) {
-                if (f.rules[ri].type == MACRO_RULE_EVENT && f.rules[ri].spec == _evtSubs[i].name) {
+            if (f.active == false || f.handlers == NULL) { continue; }
+            for (uint8_t hi = 0; hi < f.nHandlers; hi++) {
+                if (f.handlers[hi].type == MACRO_H_ON && f.handlers[hi].key == _evtSubs[i].name) {
                     used = true; break;
                 }
             }
@@ -1525,51 +1119,38 @@ void CLASS_MODULE_MACROS::pruneEventSubs() {
 }
 
 // ============================================================
-// Мета-cron и исполнительная машина
+// Исполнительная машина
 // ============================================================
 
-static bool macroMetaGate(MacroFile& f, bool ntpSync) {
-    if (f.metaCron.length() == 0) { return true; }
-    if (f.metaValid == false) { return false; }
-    if (ntpSync == false) { return false; }
-
-    time_t t = (time_t)now();
-    if (f.metaInit == false || t >= f.metaNext) {
-        time_t from = (t > 0) ? (t - 1) : 0;
-        f.metaNext = cron_next(&f.metaExpr, from);
-        f.metaInit = true;
-    }
-    return (f.metaNext != (time_t)-1 && f.metaNext <= t);
-}
-
 void CLASS_MODULE_MACROS::drainEvents() {
-    bool ntpSync = (NTP.getLastNTPSync() > 0);
+    if (_lua == NULL) { return; }
+    lua_State* L = _lua->getLuaState();
+    if (L == NULL) { return; }
+
     while (_evIn != _evOut) {
         MacroEvent ev = _evQueue[_evOut];
         _evOut = (_evOut + 1) % MACRO_EV_QUEUE;
 
+        const char* typeName =
+            (ev.type == MACRO_H_TERM) ? "term" :
+            (ev.type == MACRO_H_BUTTON) ? "button" : "on";
+
         for (uint8_t i = 0; i < _fileCount; i++) {
             MacroFile& f = _files[i];
-            if (f.run == false || f.active == false || f.rules == NULL) { continue; }
-            if (macroMetaGate(f, ntpSync) == false) { continue; }
-            for (uint8_t j = 0; j < f.nRules; j++) {
-                MacroRule& r = f.rules[j];
-                if (r.type != ev.type || r.spec != ev.spec) { continue; }
-
-                // Для правил с первичным триггером cond с op=changed сравнивается
-                // с моментом предыдущего срабатывания этого правила.
-                String errTxt;
-                bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
-                if (errTxt.length() > 0) { f.err = errTxt; continue; }
-                if (ok) {
-                    fireRule(f, r);
-                }
+            if (f.run == false || f.active == false || f.handlers == NULL) { continue; }
+            for (uint8_t j = 0; j < f.nHandlers; j++) {
+                MacroHandler& h = f.handlers[j];
+                if (h.type != ev.type || h.key != ev.spec) { continue; }
+                const BusValue* vp = (ev.type == MACRO_H_ON) ? &ev.value : nullptr;
+                macroCallHandler(L, f, h, typeName, vp);
             }
         }
     }
 }
 
 void CLASS_MODULE_MACROS::tickStep() {
+    MacroLockGuard lk(_lock);   // сериализация с веб-обработчиками (AsyncTCP)
+
     rebuildScripts();
 
     if (_config.enabled == false) { return; }
@@ -1580,7 +1161,6 @@ void CLASS_MODULE_MACROS::tickStep() {
     if (ntpSync && !_ntpWasSynced) {
         _ntpWasSynced = true;
         DEBUGMACROS("[MACRO] NTP synced, cron activated\r\n");
-        // Файлы, добавленные до NTP, получают реальную дату создания (только в памяти).
         for (uint8_t i = 0; i < _fileCount; i++) {
             if (_files[i].created < MACRO_CREATED_MIN) {
                 _files[i].created = (uint32_t)now();
@@ -1588,102 +1168,84 @@ void CLASS_MODULE_MACROS::tickStep() {
         }
     }
 
-    // Скачок времени (NTP-синк, смена TZ, ручной time.set, откат источника): cron-правила
-    // пропускают «прошлые» срабатывания — next пересчитывается без выполнения.
+    if (_lua == NULL) { return; }
+    lua_State* L = _lua->getLuaState();
+    if (L == NULL) { return; }
+
+    // Скачок времени: cron-расписания пересчитываются без выполнения.
     time_t tNow = (time_t)now();
     int64_t tickDiff = (int64_t)tNow - (int64_t)_lastTickNow;
     bool bigJump = (_lastTickNow == 0)
         || (tickDiff > MACRO_CRON_JUMP_MAX_S) || (tickDiff < -MACRO_CRON_JUMP_MAX_S);
-    if (bigJump) {
-        // База пересчёта next — максимум текущего и предыдущего такта: после ОТКАТА
-        // времени next уходит за уже пройденную (в прежней шкале) точку, поэтому при
-        // «догоне» правило не срабатывает повторно.
-        time_t base = (tNow > _lastTickNow) ? tNow : _lastTickNow;
-        DEBUGMACROS("[MACRO] time jump %+lds, re-arm cron (no fire)\r\n",
-                    (long)(tNow - _lastTickNow));
-        for (uint8_t i = 0; i < _fileCount; i++) {
-            MacroFile& f = _files[i];
-            if (f.run == false || f.active == false || f.rules == NULL) { continue; }
-            for (uint8_t j = 0; j < f.nRules; j++) {
-                MacroRule& r = f.rules[j];
-                if (r.type == MACRO_RULE_CRON) {
-                    if (r.next == 0 || r.next == (time_t)-1) { continue; }
-                    r.next = cron_next(&r.expr, base);
-                } else if (r.type == MACRO_RULE_COND || r.type == MACRO_RULE_BODY) {
-                    r.lastCond = false;   // сброс фронта после скачка
-                }
-            }
-        }
-    }
+    time_t jumpBase = (tNow > _lastTickNow) ? tNow : _lastTickNow;
     _lastTickNow = tNow;
 
+    // 1) Тела сценариев — round-robin, не более MACRO_BODY_PER_TICK за тик.
+    // Тело перерегистрирует обработчики и выполняет реактивные операторы; при
+    // большом числе активных сценариев нагрузка на loop-задачу ограничена.
+    if (_fileCount > 0) {
+        for (uint8_t k = 0; k < MACRO_BODY_PER_TICK; k++) {
+            uint8_t i = _bodyCursor;
+            _bodyCursor = (uint8_t)((_bodyCursor + 1) % _fileCount);
+            MacroFile& f = _files[i];
+            if (f.run == false || f.active == false || f.handlers == NULL) { continue; }
+            macroRunBody(L, f);
+        }
+    }
+
+    // 2) Обработчики и расписания — для всех активных файлов на каждом тике.
+    uint32_t ms = millis();
     for (uint8_t i = 0; i < _fileCount; i++) {
         MacroFile& f = _files[i];
-        if (f.run == false || f.active == false || f.rules == NULL) { continue; }
+        if (f.run == false || f.active == false || f.handlers == NULL) { continue; }
 
-        bool gate = macroMetaGate(f, ntpSync);
-
-        for (uint8_t j = 0; j < f.nRules; j++) {
-            MacroRule& r = f.rules[j];
-
-            // term/button/on исполняются в drainEvents()
-            if (r.type == MACRO_RULE_TERM || r.type == MACRO_RULE_BUTTON || r.type == MACRO_RULE_EVENT) {
-                continue;
+        if (bigJump) {
+            for (uint8_t j = 0; j < f.nHandlers; j++) {
+                MacroHandler& h = f.handlers[j];
+                if (h.type != MACRO_H_CRON) { continue; }
+                if (h.next == 0 || h.next == (time_t)-1) { continue; }
+                h.next = cron_next(&h.expr, jumpBase);
             }
+        }
 
-            if (r.type == MACRO_RULE_BODY) {
-                if (f.metaCron.length() > 0) {
-                    if (gate && r.lastCond == false) {
-                        r.lastCond = true;
-                        fireRule(f, r);
-                    } else if (gate == false) {
-                        r.lastCond = false;
+        // 2a) tick-обработчики
+        for (uint8_t j = 0; j < f.nHandlers; j++) {
+            if (f.handlers[j].type == MACRO_H_TICK) {
+                macroCallHandler(L, f, f.handlers[j], "tick", nullptr);
+            }
+        }
+
+        // 2b) расписания (cron/interval/after/once)
+        for (uint8_t j = 0; j < f.nHandlers;) {
+            MacroHandler& h = f.handlers[j];
+            bool fired = false;
+            bool oneShot = (h.type == MACRO_H_AFTER || h.type == MACRO_H_ONCE);
+
+            if (h.type == MACRO_H_CRON) {
+                if (ntpSync) {
+                    if (h.next == 0) {
+                        h.next = cron_next(&h.expr, tNow);
+                    } else if (h.next != (time_t)-1 && tNow >= h.next) {
+                        macroCallHandler(L, f, h, "cron", nullptr);
+                        h.next = cron_next(&h.expr, tNow);
+                        fired = true;
                     }
-                } else if (r.lastCond == false) {
-                    r.lastCond = true;
-                    fireRule(f, r);
                 }
-                continue;
+            } else if (h.type == MACRO_H_INTERVAL || h.type == MACRO_H_AFTER) {
+                if ((int32_t)(ms - h.dueMs) >= 0) {
+                    macroCallHandler(L, f, h, (h.type == MACRO_H_AFTER) ? "after" : "every", nullptr);
+                    fired = true;
+                }
+            } else if (h.type == MACRO_H_ONCE) {
+                macroCallHandler(L, f, h, "once", nullptr);
+                fired = true;
             }
 
-            if (gate == false) { continue; }
-
-            if (r.type == MACRO_RULE_CRON) {
-                if (ntpSync == false) { continue; }
-                if (r.next == 0) {
-                    // Первичная инициализация: cond не вычисляем, иначе он «застрянет»
-                    // на первом тике и потеряет момент времени.
-                    r.next = cron_next(&r.expr, (time_t)now());
-                    continue;
-                }
-                if (r.next == (time_t)-1) { continue; }
-                if ((time_t)now() >= r.next) {
-                    String errTxt;
-                    bool ok = (r.nConds == 0) || evalConds(f, r, errTxt);
-                    if (errTxt.length() > 0) { f.err = errTxt; }
-                    if (ok) {
-                        fireRule(f, r);
-                    }
-                    // Продвигаем next всегда — защита от цикла при устойчивой ошибке cond.
-                    r.next = cron_next(&r.expr, (time_t)now());
-                }
+            if (fired && oneShot) { macroRemoveHandler(L, f, j); continue; }
+            if (fired && h.type == MACRO_H_INTERVAL) {
+                h.dueMs = ms + (uint32_t)h.key.toInt() * 1000UL;
             }
-
-            if (r.type == MACRO_RULE_COND) {
-                String errTxt;
-                bool truth = evalConds(f, r, errTxt);
-                if (errTxt.length() > 0) {
-                    f.err = errTxt;
-                    DEBUGMACROS("[MACRO] %s cond error: %s\r\n", f.name.c_str(), errTxt.c_str());
-                    continue;   // fire не вызывается, lastCond не меняем
-                }
-                if (truth && r.lastCond == false) {
-                    r.lastCond = true;
-                    fireRule(f, r);
-                } else if (truth == false) {
-                    r.lastCond = false;
-                }
-            }
+            j++;
         }
     }
 }

@@ -8,6 +8,7 @@
     { "name": "/macros/ex_minsec.lua", "prio": 7, "run": false, "created": 0 },
     { "name": "/macros/ex_input.lua",  "prio": 7, "run": false, "created": 0 },
     { "name": "/macros/ex_bus.lua",    "prio": 7, "run": false, "created": 0 },
-    { "name": "/macros/ex_lua.lua",    "prio": 7, "run": false, "created": 0 }
+    { "name": "/macros/ex_lua.lua",    "prio": 7, "run": false, "created": 0 },
+    { "name": "/macros/veml7700_brightness.lua", "prio": 7, "run": false, "created": 0 }
   ]
 }

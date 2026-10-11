@@ -15,6 +15,22 @@
 
 #include <LittleFS.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// Защита runtime модуля от гонок: веб-обработчики AsyncWebServer выполняются в
+// задаче AsyncTCP, а тик «барабана» — в loop-задаче. Один рекурсивный мьютекс
+// сериализует доступ к _files/_lua/очереди событий между ними.
+struct MacroLockGuard {
+    SemaphoreHandle_t m;
+    explicit MacroLockGuard(SemaphoreHandle_t s) : m(s) {
+        if (m != nullptr) { xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    }
+    ~MacroLockGuard() {
+        if (m != nullptr) { xSemaphoreGiveRecursive(m); }
+    }
+};
+
 #define CONFIG_FILE_MACROS    "/config_macros.json"
 #define MACROS_DIR            "/macros"
 #define MACROS_DIR_RE         "/macros/"
@@ -33,9 +49,11 @@ public:
 
     // Публичное API
     bool reloadAll();                        // перечитать все файлы сценариев
-    bool fireToken(uint8_t type, const String& spec); // событие term/button в очередь
+    bool fireToken(uint8_t type, const String& spec,
+                   const BusValue& value = BusValue()); // событие term/button/on в очередь
     uint8_t getFileCount();
     void printList();                        // вывод списка сценариев в терминал
+    void ensureEventSub(const String& name); // подписка на событие шины (для on())
 
 private:
     // Версионные методы
@@ -70,11 +88,12 @@ private:
 
     // Логика работы со списком файлов
     int  findFile(const String& name);       // индекс в _files или -1
+    uint8_t runningCount();                  // число запущенных файлов (run==true)
     bool nameOk(const String& name);         // проверка имени (без пути)
     void markAllDirty();                     // пометить все run-файлы на переразбор
     void bumpMeta();                         // отметить изменение списка (пересборка в tick)
     void reconcileList();                    // скан /macros + слияние с метой + сохранение
-    void ensureMacrosDir();                  // создать /macros и пример example.lua
+    void ensureMacrosDir();                  // создать /macros
     String readFile(const String& path);     // содержимое файла в String
     bool writeFile(const String& path, const String& data);
     bool fsRenameFile(const String& oldPath, const String& newPath); // копия + удаление
@@ -90,15 +109,11 @@ private:
 
     // Движок «барабана» (вызывается только в main-loop: tick/терминал)
     bool initLua();                          // создать единый интерпретатор и команды
-    bool registerFile(MacroFile& f);         // разобрать rules и закрыть файл
-    void unregisterFile(MacroFile& f);       // снять правила и подписки
-    void rebuildScripts();                   // (пере)регистрация только needParse
-    bool anyNeedParse();                     // есть ли файлы, требующие разбора
-    void refreshFileMeta(MacroFile& f);      // читать desc/meta_cron без разбора правил
-    void fireRule(MacroFile& f, MacroRule& r);// исполнить действие правила
-    String runHandler(MacroFile& f, MacroRule& r); // вызвать named-handler (Lua)
-    bool evalConds(MacroFile& f, MacroRule& r, String& errTxt); // составное условие (AND)
-    void ensureEventSub(const String& name); // подписаться на событие шины
+    bool registerFile(MacroFile& f);         // скомпилировать чанк и создать окружение/state
+    void unregisterFile(MacroFile& f);       // снять обработчики/подписки, освободить refs
+    void rebuildScripts();                   // (пере)компиляция только needParse
+    bool anyNeedParse();                     // есть ли файлы, требующие компиляции
+    void refreshFileMeta(MacroFile& f);      // читать desc без запуска живого файла
     void pruneEventSubs();                   // снять неиспользуемые подписки
     void drainEvents();                      // обработка очереди внешних событий
     void tickStep();                         // шаг «барабана» за одну секунду
@@ -106,6 +121,8 @@ private:
 
 protected:
     fs::LittleFSFS* _fs;
+
+    SemaphoreHandle_t _lock;  // рекурсивный мьютекс runtime модуля (loop vs AsyncTCP)
 
     strMacrosConfig _config;
     MacroFile* _files;       // массив файлов-сценариев (heap, MACRO_MAX_FILES)
@@ -127,6 +144,7 @@ protected:
     uint8_t _evOut;
 
     time_t _lastTickNow = 0;   // now() прошлого тика (детект скачка времени)
+    uint8_t _bodyCursor = 0;   // курсор round-robin исполнения тел сценариев
 
     friend void macroTickTask();   // 1-сек задача EERTOS
     friend void macroCmd();        // обработчик терминальной команды "macro"

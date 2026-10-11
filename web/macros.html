@@ -73,7 +73,7 @@
                 <thead>
                     <tr>
                         <th><input type="checkbox" id="chkAll" onclick="toggleAll(this.checked)"></th>
-                        <th>prio</th><th>start/stop</th><th>name</th><th>cron</th>
+                        <th>prio</th><th>start/stop</th><th>name</th><th>handlers</th>
                         <th>desc</th><th>run</th><th>err</th><th>created</th>
                     </tr>
                 </thead>
@@ -83,10 +83,10 @@
     </div>
 
     <div class="macros-layout">
-        <div class="macros-left">
+        <div class="macros-left" onmouseenter="loadResources()">
             <div class="panel">
-                <h4>Resources <button onclick="loadResources()">Refresh</button></h4>
-                <div id="resTree"></div>
+                <h4>Resources <button onclick="loadResources(true)">Refresh</button></h4>
+                <div id="resTree"><span style="color:#888;font-size:12px;">Наведите — загрузится каталог</span></div>
             </div>
             <div class="panel" style="flex: 0 0 auto;">
                 <h4>Properties</h4>
@@ -124,6 +124,12 @@
         let RUNMAP = {};
         let EDITOR_AVAILABLE = false;
         let CUR_TREE = {};
+        // Кэш содержимого файлов: текст макроса грузим только по клику и только один
+        // раз за сессию страницы (повторный клик берёт из кэша, без веб-запроса).
+        let FILE_CACHE = {};
+        // Каталог ресурсов (~11 КБ) грузим по требованию (при наведении/Refresh),
+        // а не при открытии страницы.
+        let RESOURCES_READY = false;
 
         function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
         function fmtDate(ts) { if (!ts) { return '-'; } const d = new Date(ts * 1000); return d.toLocaleString(); }
@@ -167,8 +173,8 @@
 
                     tr.insertAdjacentHTML('beforeend', '<td>' + esc(f.name) + '</td>');
                     const tdCron = document.createElement('td');
-                    tdCron.textContent = f.cron || '';
-                    tdCron.title = f.cron ? ('meta_cron: ' + f.cron) : '(нет meta_cron — активен всегда)';
+                    tdCron.textContent = (f.handlers || 0);
+                    tdCron.title = 'число обработчиков сценария';
                     tr.appendChild(tdCron);
                     tr.insertAdjacentHTML('beforeend',
                         '<td>' + esc(f.desc || '') + '</td>' +
@@ -181,6 +187,9 @@
                     body.appendChild(tr);
                 }
                 CUR_EDIT_RUN = !!RUNMAP[CUR_EDIT];
+                // Чистим кэш текстов для удалённых/переименованных файлов.
+                const present = new Set(files.map(f => f.name));
+                for (const k of Object.keys(FILE_CACHE)) { if (!present.has(k)) { delete FILE_CACHE[k]; } }
                 syncSelUi();
                 updateEditorLock();
             } finally {
@@ -313,9 +322,16 @@
             const n = firstSelected(); if (!n) { return; }
             openFile(n);
         }
-        async function openFile(name) {
+        async function openFile(name, force) {
             document.getElementById('editName').innerText = name;
+            if (!force && Object.prototype.hasOwnProperty.call(FILE_CACHE, name)) {
+                document.getElementById('lua').value = FILE_CACHE[name];
+                onEdit();
+                updateEditorLock();
+                return;
+            }
             const body = await (await fetch('/macros/get?name=' + encodeURIComponent(name), { cache: 'no-store' })).text();
+            FILE_CACHE[name] = body;
             document.getElementById('lua').value = body;
             onEdit();
             updateEditorLock();
@@ -352,6 +368,7 @@
             const r = await api('/macros/save?name=' + encodeURIComponent(n) + '&body=' + encodeURIComponent(document.getElementById('lua').value));
             document.getElementById('editStatus').innerText = r;
             if (r.trim() !== 'OK') { alert(r); }
+            else { FILE_CACHE[n] = document.getElementById('lua').value; }
             refresh();
         }
         async function validateBody() {
@@ -391,8 +408,10 @@
         }
 
         // ---- Дерево ресурсов ----
-        async function loadResources() {
+        async function loadResources(force) {
+            if (RESOURCES_READY && !force) { return; }
             const data = await (await fetch('/macros/resources', { cache: 'no-store' })).json();
+            RESOURCES_READY = true;
             const feat = data.features || {};
             EDITOR_AVAILABLE = (feat.editor === 1);
             document.getElementById('btnEdit').style.display = EDITOR_AVAILABLE ? '' : 'none';
@@ -445,18 +464,24 @@
         function insertSnippet(r) {
             if (CUR_EDIT_RUN) { return; }   // запущенный сценарий — только просмотр
             const ta = document.getElementById('lua');
+            const parts = (r.full || '').split('.');
+            const nsName = parts[0] || '';
+            const field = r.name || parts[1] || '';
+            const ref = nsName + '.' + field;
             let s;
             if (r.kind === 'ENUM') {
                 const cur = r.valueName || (r.enum && r.enum[0]) || '';
                 if (cur) {
-                    s = (r.f ? 'call("' + r.full + '", "' : 'set("' + r.full + '", "') + cur + '")';
+                    // dual (state+func) — вызов функции; иначе — запись поля
+                    s = (r.f ? ref + '("' + cur + '")' : ref + ' = "' + cur + '"');
                 } else {
-                    s = '-- ' + r.full + ': enum (значение неизвестно)';
+                    s = '-- ' + ref + ': enum (значение неизвестно)';
                 }
             } else if (r.f) {
-                s = (r.a ? '-- async: вызывается движком, без callback\n' : '') + 'call("' + r.full + '")';
+                // Чтение состояния dual-ресурса — только через get(); здесь — вызов функции.
+                s = (r.a ? '-- async: вызывается движком\n' : '') + ref + '()';
             } else {
-                s = 'get("' + r.full + '")';
+                s = 'local v = ' + ref;
             }
             const p = ta.selectionStart;
             ta.value = ta.value.slice(0, p) + s + ta.value.slice(ta.selectionEnd);
@@ -502,12 +527,11 @@
         }
 
         window.onload = function() {
-            setTimeout(() => {
-                ApplyCVT("/system/version").then(() => ApplyCVT("/macros/ver"));
-            }, 500);
             initSplitter();
-            refresh();
-            loadResources();
+            // Запросы последовательно (одно соединение за раз), без каталога ресурсов.
+            ApplyCVT("/system/version")
+                .then(() => ApplyCVT("/macros/ver"))
+                .then(() => refresh());
         };
     </script>
 </body>

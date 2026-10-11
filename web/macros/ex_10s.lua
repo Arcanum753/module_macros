@@ -1,10 +1,6 @@
--- Демонстрация: meta_cron (гейт окна) + запись в состояние.
--- meta_cron — «окно»: сценарий активен только в секунды, совпадающие с выражением.
--- set на dual-ресурсе (ENUM + write-функция) применяет значение через функцию.
-return {
-    desc = "every 10s: effect = 1",
-    meta_cron = "*/10 * * * * *",
-    rules = {
-        { set = "e7.effect", value = 1 },
-    },
-}
+-- every 10s: effect = "rainbow" (ENUM — только буквенное имя).
+meta{ desc = "every 10s: effect = rainbow" }
+
+every("*/10 * * * * *", function()
+    e7.effect = "rainbow"
+end)

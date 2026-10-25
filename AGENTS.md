@@ -67,9 +67,9 @@ pio run -e esp32_electronica7_rgb_macros
 - `RELEASE` — гасит общие логи (`DEBUGLOG` core_web/json);
 - `DEBUGLOG_WIFI` — логи Wi-Fi.
 
-**Важно:** env с Lua-движком использует таблицу партиций `partitions_esp32_macro.csv`
-(лежит в корне ядра): app0/app1 по 1344 КБ, spiffs 1336 КБ. Остальные env используют
-`partitions_esp32.csv`.
+**Важно:** все ESP32 env используют единую таблицу `partitions_esp32.csv`
+(лежит в корне ядра): app0/app1 по 1472 КБ, spiffs 1080 КБ. Путь форсируется
+pre-script `python/0_esp32_common.py`.
 
 После прошивки:
 1. Модуль создаёт каталог `/macros/` (если его нет). Файлы-примеры приходят с файловой

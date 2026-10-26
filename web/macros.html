@@ -510,7 +510,8 @@
                 }
             } else if (r.f) {
                 // Чтение состояния dual-ресурса — только через get(); здесь — вызов функции.
-                s = (r.a ? '-- async: вызывается движком\n' : '') + ref + '()';
+                const snippet = (r.kind === 'STR') ? ref + '("...")' : ref + '()';
+                s = (r.a ? '-- async: вызывается движком\n' : '') + snippet;
             } else {
                 s = 'local v = ' + ref;
             }

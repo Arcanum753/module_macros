@@ -22,7 +22,7 @@ every("0 0 19 * * *", function()
     wifi.mode("auto")
     e7.mode("macro")
     e7.effect("mono")
-    e7.color(16711680)
+    e7.color("#FF0000")
 end)
 
 every("0 3 19 * * *", probeAuto)

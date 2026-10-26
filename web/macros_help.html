@@ -77,6 +77,14 @@ end</pre>
             Регистр не важен.
         </p>
 
+        <div class="note">
+            <b>Цвета</b> — только строки <code>"#RRGGBB"</code> (CSS-хекс, 6 цифр).
+            <code>e7.color("#FF0000")</code>, <code>e7.color = "#00FF00"</code>,
+            <code>get("e7.color")</code> → строка. Числа, <code>#RGB</code> и
+            <code>0xRRGGBB</code> не принимаются. Ошибка чтения строки даёт
+            <code>"#FFFFFF"</code>, невалидная запись — <code>BAD_VALUE</code>.
+        </div>
+
         <h3>4. Состояние <code>state</code></h3>
         <p>
             Таблица <code>state</code> (одна на файл) живёт между тиками — для фронтов и памяти.

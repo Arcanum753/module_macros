@@ -60,6 +60,20 @@ end</pre>
             <li><code>ENUM</code> → <b>строковое каноничное имя</b> (например <code>wifi.target</code> → <code>"sta"</code>).</li>
         </ul>
         <div class="note">
+            <b>Откуда берётся список ресурсов.</b> Дерево <i>Resources</i> строится из файла
+            <code>/macros/resources.json</code>. Файл собирается автоматически при сборке
+            файловой системы (<code>python/gen_resources_catalog.py</code>) из вызовов
+            <code>regState</code>/<code>regEnum</code>/<code>regFunc</code>/<code>regEvent</code>
+            компонентов, включённых в сборку. Поэтому:
+            <ul>
+                <li>вручную файл править не нужно — при следующей прошивке ФС он перезаписывается;</li>
+                <li>чтобы ресурс появился в дереве, он должен быть зарегистрирован в коде литеральной строкой;</li>
+                <li>имена, собранные динамически, и асинхронные функции (<code>regFuncAsync</code>)
+                    в список не попадают;</li>
+                <li>актуальность списка обеспечивается регистрациями в коде, а не правкой файла.</li>
+            </ul>
+        </div>
+        <div class="note">
             <b>Dual-ресурсы</b> (состояние + write-функция, например <code>e7.speed</code>,
             <code>e7.brightness</code>, <code>e7.effect</code>, <code>wifi.mode</code>):
             <code>ns.field</code> возвращает <b>вызываемый</b> объект — используйте

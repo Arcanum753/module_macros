@@ -117,7 +117,6 @@ pre-script `python/0_esp32_common.py`.
 | `/macros/prio?name=&dir=+1|-1` | изменить приоритет |
 | `/macros/reload?name=` | перечитать (без name — все) |
 | `/macros/fire?type=&token=` | внешнее событие (`term`/`button`) |
-| `/macros/resources` | каталог ресурсов шины (JSON; для ENUM — `value`/`valueName`) |
 | `/macros/validate?cron=&body=` | проверка cron и сценария: компиляция + пробный прогон тела (без побочных действий) |
 | `/macros/get?name=` / `/macros/save?name=&body=` | чтение/запись сценария |
 | `/macros/ver` | версия модуля (также используется страницей `state.html`) |
@@ -125,6 +124,27 @@ pre-script `python/0_esp32_common.py`.
 | `/state/module_mode?ns=&mode=` | смена режима модуля `off/auto/macro` |
 
 Файлы `.lua` открываются в `module_editor` (`edit.html`) как текстовые.
+
+### Каталог ресурсов (дерево Resources)
+
+Список ресурсов страница берёт из `/macros/resources.json` — статического файла в образе ФС.
+Он собирается **автоматически при сборке ФС** (`python/gen_resources_catalog.py`, шаг 7b в
+`python/4_fs_builder.py`) из вызовов `regState`/`regStateAs`/`regEnum`/`regFunc`/`regEvent`
+компонентов, включённых в `src_filter` (+ все `core_*`); namespace — из `[registry]`
+их `.ini` (или имени каталога) с переопределением через `setNamespace(...)` в `.cpp`.
+Рантайм-эндпоинта `/macros/resources` больше нет.
+
+- Файл в репозитории не хранится и вручную не правится — при следующей прошивке ФС он
+  перезаписывается.
+- Чтобы ресурс появился в дереве, он должен быть зарегистрирован в коде **литеральной строкой**.
+- Имена, собранные динамически (конкатенация/переменная), в каталог не попадают.
+- `regFuncAsync` генератор не парсит: асинхронные функции в каталог не попадают, флаг `a`
+  в файле всегда `false`.
+- Формат записи: `ns`, `name`, `full`, `kind`, `desc`, `rw`, `e` (есть событие), `f` (есть
+  функция), `a` (async), `enum` (значения ENUM). Корень:
+  `{"features":{"editor":0|1},"resources":[…]}`; `editor=1` при сборке с `module_editor`.
+
+Ответственность за актуальность списка — на регистрациях в коде компонентов, а не на файле.
 
 ---
 
@@ -445,6 +465,10 @@ web (/macros.html) ──GET──▶ web_Init-эндпоинты  → FS + /con
 | `tests/macros/*.lua` | HIL-сценарии |
 | `module_macros_version.h` | версия модуля (автогенерация) |
 
+`web/macros/resources.json` в репозитории **отсутствует намеренно**: файл создаётся при
+сборке ФС генератором `python/gen_resources_catalog.py` и кладётся в образ как
+`/macros/resources.json`.
+
 Стандартные библиотеки Lua (`lbaselib`, `lstrlib`, `ltablib`, `lmathlib`, `lutf8lib`, `ldump`)
 **отключены от сборки** (`*.c.disabled`). В сценариях доступен только язык Lua + функции
 модуля.
@@ -506,7 +530,7 @@ web (/macros.html) ──GET──▶ web_Init-эндпоинты  → FS + /con
 - FR-MACROS-10: Лимиты: `MACRO_MAX_FILES=40`, `MACRO_MAX_HANDLERS=16`, `MACRO_EV_QUEUE=8`,
   `MACRO_MAX_EVENT_SUBS=8`, `MACRO_HEAP_BUDGET=100 КБ`, `MACRO_HEAP_CRIT_PCT=95%`,
   `MACRO_LUA_MAX_OPS=100000`, `MACRO_PARSE_PER_TICK=2`, `MACRO_PARSE_MAX_RETRY=3`,
-  `MACRO_LUA_MIN_HEAP=24 КБ`, `MACRO_RES_CACHE_MS=1000`.
+  `MACRO_LUA_MIN_HEAP=24 КБ`.
 - FR-MACROS-11: Ресурсы bus: `macros.enabled` (BOOL), `macros.files` (I32); функция
   `macros.reload`; namespace привилегированный.
 - FR-MACROS-12: Редактирование/сохранение сценария — только для остановленного файла.

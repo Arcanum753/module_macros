@@ -214,7 +214,7 @@
         }
 
         // Валидация бюджета heap модуля: сервер оценивает занятую память
-        // (файлы + правила + Lua + каталог) и сравнивает с лимитом.
+        // (файлы + правила + Lua) и сравнивает с лимитом.
         async function validateMacros() {
             const info = document.getElementById('heapInfo');
             info.style.color = '#333';
@@ -224,7 +224,7 @@
                 const kb = v => (v / 1024).toFixed(1);
                 let msg = 'heap: ' + kb(r.used) + ' / ' + kb(r.budget) + ' КБ (' + r.percent + '% от бюджета)';
                 msg += '  |  файлов: ' + r.files + ' (активных ' + r.active + '), правил: ' + r.rules;
-                msg += '  |  lua: ' + kb(r.lua) + ' КБ, каталог: ' + kb(r.catalog) + ' КБ';
+                msg += '  |  lua: ' + kb(r.lua) + ' КБ';
                 msg += '  |  free: ' + kb(r.free) + ' КБ';
                 if (r.critical) {
                     info.style.color = '#c00000';
@@ -409,7 +409,6 @@
 
         // ---- Дерево ресурсов (двухэтапно) ----
         // 1) список ресурсов — из статического /macros/resources.json (генерируется при сборке FS);
-        //    фолбэк — рантайм /macros/resources, если файла нет.
         // 2) значения/детали ресурса — по клику через лёгкий /state/info.
         async function loadResources(force) {
             if (RESOURCES_READY && !force) { return; }
@@ -418,11 +417,7 @@
             try {
                 const rs = await fetch('/macros/resources.json', { cache: 'no-store' });
                 if (rs.ok) { data = await rs.json(); }
-            } catch (e) { /* нет файла — упадём на рантайм */ }
-            if (!data) {
-                try { data = await (await fetch('/macros/resources', { cache: 'no-store' })).json(); }
-                catch (e) { data = null; }
-            }
+            } catch (e) { data = null; }
             if (!data) {
                 tree.innerHTML = '<span style="color:#c00;font-size:12px;">каталог ресурсов недоступен</span>';
                 return;

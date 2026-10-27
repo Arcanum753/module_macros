@@ -32,8 +32,6 @@ CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
     _lua = NULL;
     _luaHeapBytes = 0;
     _nEvtSubs = 0;
-    _resourcesReady = false;
-    _resourcesMs = 0;
     _lock = NULL;
 }
 
@@ -188,6 +186,9 @@ static int macroBusReload(void* user, int argc, const BusValue* argv, BusValue& 
     return BUS_OK;
 }
 
+// Ресурсы шины (namespace macros): состояния enabled, files; функция reload.
+// Каталог /macros/resources.json собирается при сборке ФС
+// (python/gen_resources_catalog.py) из этих вызовов — вручную не правим.
 void CLASS_MODULE_MACROS::register_resources() {
     DEBUGMACROS("%s\r\n", __FUNCTION__);
 
@@ -248,12 +249,6 @@ void CLASS_MODULE_MACROS::web_Init() {
     ESPHTTPServer.on("/macros/fire", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
         this->handleFire(request);
-    });
-
-    // AJAX — каталог ресурсов шины (для дерева на странице)
-    ESPHTTPServer.on("/macros/resources", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        if (!ESPHTTPServer.checkAuth(request)) { return request->requestAuthentication(); }
-        this->handleResources(request);
     });
 
     // AJAX — валидация cron/синтаксиса Lua
@@ -615,63 +610,6 @@ void CLASS_MODULE_MACROS::handleModuleMode(AsyncWebServerRequest *request) {
     }
 }
 
-void CLASS_MODULE_MACROS::handleResources(AsyncWebServerRequest *request) {
-    MacroLockGuard lk(_lock);
-    // Каталог отдаём напрямую через send() (стриминговый AsyncResponseStream на
-    // большом ответе не досылал байты → клиент зависал, зависшие соединения
-    // добивали heap).
-    // Сборка каталога — тяжёлая (JsonDocument); при параллельных запросах это
-    // переполняло heap и давало abort() в operator new. Поэтому каталог кэшируем
-    // (TTL MACRO_RES_CACHE_MS) и пересобираем не чаще одного раза за TTL.
-    bool rebuild = (!_resourcesReady) ||
-                   ((uint32_t)(millis() - _resourcesMs) >= MACRO_RES_CACHE_MS);
-
-    if (rebuild) {
-        // На сборку нужен запас: JsonDocument + строка каталога.
-        size_t need = _resourcesJson.length() + 4096;
-        if (need < 8000) { need = 8000; }
-        if (ESP.getMaxAllocHeap() < need) {
-            if (_resourcesReady && _resourcesJson.length() > 0) {
-                sendStringChunked(request, "application/json", _resourcesJson);
-                return;
-            }
-            request->send(503, "text/plain", "ERR: low memory");
-            return;
-        }
-
-        // JsonDocument в отдельном блоке: освобождается до копирования ответа.
-        bool built = false;
-        {
-            JsonDocument doc;
-            core_state.catalogToJson(doc);
-            if (!doc.overflowed()) {
-                _resourcesJson = "";
-                serializeJson(doc, _resourcesJson);
-                _resourcesReady = true;
-                _resourcesMs = millis();
-                built = true;
-            }
-        }
-        if (!built) {
-            if (_resourcesReady && _resourcesJson.length() > 0) {
-                sendStringChunked(request, "application/json", _resourcesJson);
-                return;
-            }
-            request->send(500, "text/plain", "ERR: catalog too large");
-            return;
-        }
-    }
-
-    // Перед ответом проверяем запас под снимок каталога.
-    if (ESP.getMaxAllocHeap() < _resourcesJson.length() + 1024) {
-        request->send(503, "text/plain", "ERR: busy");
-        return;
-    }
-
-    // Большой каталог отдаём chunked-ответом (без копии тела в AsyncBasicResponse).
-    sendStringChunked(request, "application/json", _resourcesJson);
-}
-
 void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
     MacroLockGuard lk(_lock);
     DEBUGMACROS("%s\r\n", __FUNCTION__);
@@ -704,8 +642,8 @@ void CLASS_MODULE_MACROS::handleValidate(AsyncWebServerRequest *request) {
 }
 
 // Оценка heap, занятого модулем: массив файлов + runtime активных файлов
-// (chunk/env/state refs + массив обработчиков) + единый lua_State + кэш
-// каталога. Служит для проверки бюджета (/macros/heap).
+// (chunk/env/state refs + массив обработчиков) + единый lua_State.
+// Служит для проверки бюджета (/macros/heap).
 size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
     size_t total = 0;
 
@@ -726,7 +664,6 @@ size_t CLASS_MODULE_MACROS::estimateHeapBytes() {
     }
 
     total += _luaHeapBytes;                  // единый интерпретатор
-    total += _resourcesJson.length() + 1;    // кэш каталога ресурсов
     for (uint8_t i = 0; i < _nEvtSubs; i++) { total += _evtSubs[i].name.length() + 1; }
     return total;
 }
@@ -754,7 +691,6 @@ void CLASS_MODULE_MACROS::handleHeap(AsyncWebServerRequest *request) {
     resp->print(",\"active\":");   resp->print(active);
     resp->print(",\"rules\":");    resp->print(handlers);
     resp->print(",\"lua\":");      resp->print((uint32_t)_luaHeapBytes);
-    resp->print(",\"catalog\":");  resp->print((uint32_t)_resourcesJson.length());
     resp->print("}");
     request->send(resp);
 }

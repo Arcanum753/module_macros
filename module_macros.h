@@ -71,7 +71,6 @@ private:
     void handlePrio(AsyncWebServerRequest *request);
     void handleReload(AsyncWebServerRequest *request);
     void handleFire(AsyncWebServerRequest *request);
-    void handleResources(AsyncWebServerRequest *request);
     void handleValidate(AsyncWebServerRequest *request);
     void handleHeap(AsyncWebServerRequest *request);
     void handleWrite(AsyncWebServerRequest *request);
@@ -134,10 +133,6 @@ protected:
 
     struct { String name; uint32_t handle; } _evtSubs[MACRO_MAX_EVENT_SUBS];
     uint8_t _nEvtSubs;
-
-    String _resourcesJson;    // последний успешный каталог ресурсов (кэш + fallback)
-    bool   _resourcesReady;   // в _resourcesJson лежит валидная строка
-    uint32_t _resourcesMs;    // millis() последней сборки каталога (кэш по TTL)
 
     MacroEvent _evQueue[MACRO_EV_QUEUE];     // очередь внешних событий (term/button/on)
     uint8_t _evIn;

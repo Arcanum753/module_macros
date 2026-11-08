@@ -1,6 +1,6 @@
 // Auto-generated version file for module: module_macros
-// Generated: 2026-10-27 08:17
-// Environment: esp32_clock-mech
+// Generated: 2026-10-31 20:19
+// Environment: esp32-swd
 
 #ifndef MODULE_MACROS_VERSION_H
 #define MODULE_MACROS_VERSION_H
@@ -10,36 +10,36 @@
 // ============================================================
 
 // Числовая версия (для сравнений)
-#define MODULE_MACROS_VERSION 17
+#define MODULE_MACROS_VERSION 18
 
 // Строковая версия
-#define MODULE_MACROS_VERSION_STR "17"
+#define MODULE_MACROS_VERSION_STR "18"
 
 // Хэш последнего обработанного коммита кода (без учёта *_version.h)
-#define MODULE_MACROS_COMMIT_HASH "ee5089b9d5eef791343524cf69dc7b5e0f22e8ef"
+#define MODULE_MACROS_COMMIT_HASH "86439909e6a7380cf616225f92291ed5799df950"
 
 // ============================================================
 // ДАТА ПОСЛЕДНЕГО ИЗМЕНЕНИЯ
 // ============================================================
 
 // Дата в формате yyyy.mm.dd hh.mm (как строка)
-#define MODULE_MACROS_COMMIT_DATE_STR "2026.10.27 08:04"
+#define MODULE_MACROS_COMMIT_DATE_STR "2026.10.30 22:49"
 
 // Компоненты даты (для числовых операций)
 #define MODULE_MACROS_COMMIT_YEAR 2026
 #define MODULE_MACROS_COMMIT_MONTH 10
-#define MODULE_MACROS_COMMIT_DAY 27
-#define MODULE_MACROS_COMMIT_HOUR 8
-#define MODULE_MACROS_COMMIT_MINUTE 4
+#define MODULE_MACROS_COMMIT_DAY 30
+#define MODULE_MACROS_COMMIT_HOUR 22
+#define MODULE_MACROS_COMMIT_MINUTE 49
 
 // Полная дата в формате YYYY-MM-DD HH:MM (для отладки)
-#define MODULE_MACROS_COMMIT_DATE "2026-10-27 08:04"
+#define MODULE_MACROS_COMMIT_DATE "2026-10-30 22:49"
 
 // ============================================================
 // ИНФОРМАЦИЯ О ГЕНЕРАЦИИ
 // ============================================================
 
-#define MODULE_MACROS_GENERATED_TIME "2026-10-27 08:17"
-#define MODULE_MACROS_GENERATED_TIMESTAMP "20261027_081756"
+#define MODULE_MACROS_GENERATED_TIME "2026-10-31 20:19"
+#define MODULE_MACROS_GENERATED_TIMESTAMP "20261031_201942"
 
 #endif // MODULE_MACROS_VERSION_H

@@ -40,6 +40,18 @@ CLASS_MODULE_MACROS::CLASS_MODULE_MACROS() {
 void macroTickTask();
 void macroCmd();
 
+// Метаданные терминальной команды: подкоманды для help и справка (PROGMEM)
+static const char* const kMacroCommands[] = { "list", "reload", "run", "stop", "prio", "msg", "btn", nullptr };
+static const char kMacroHelp[] PROGMEM =
+    "macro - Lua scenarios\r\n"
+    "  macro list                        - show scenarios\r\n"
+    "  macro reload [file.lua]           - re-read scenario(s)\r\n"
+    "  macro run <file.lua>              - start scenario\r\n"
+    "  macro stop <file.lua>             - stop scenario\r\n"
+    "  macro prio <file.lua> <delta>     - change priority\r\n"
+    "  macro msg <word> [params...]      - fire term-rules by full match\r\n"
+    "  macro btn <name> [params...]      - fire button-rules by full match\r\n";
+
 // Полный сброс одного слота файла: массив _files лежит в heap и не
 // обнуляется автоматически, поэтому каждое использование слота начинается
 // с этой инициализации.
@@ -150,7 +162,8 @@ void CLASS_MODULE_MACROS::begin() {
     // Кэшируем размеры файлов один раз при старте (для /macros/list).
     for (uint8_t i = 0; i < _fileCount; i++) { updateMacroFileSize(_fs, _files[i]); }
 
-    TerminalRegisterModule(macroTerminalRegister);
+    TerminalRegisterModule("module_macros", "macro", "Lua scenarios", macroCmd,
+                           kMacroCommands, kMacroHelp, true);
 
     // Первичная сборка интерпретаторов запущенных файлов выполняется в setup()
     // (main-loop контекст, до старта веб-сервера). Помечаем все run-файлы и
@@ -1180,8 +1193,4 @@ void macroCmd() {
     Serial.println("  macro prio <file.lua> <delta>     - change priority");
     Serial.println("  macro msg <word> [params...]      - fire term-rules by full match");
     Serial.println("  macro btn <name> [params...]      - fire button-rules by full match");
-}
-
-void macroTerminalRegister() {
-    term.addCommand("macro", macroCmd);
 }

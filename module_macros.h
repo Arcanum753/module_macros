@@ -147,7 +147,4 @@ protected:
 
 extern CLASS_MODULE_MACROS module_macros;
 
-// Терминальные команды модуля (регистрируются через TerminalRegisterModule)
-void macroTerminalRegister();
-
 #endif // _MODULE_MACROS_h

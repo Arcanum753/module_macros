@@ -150,7 +150,8 @@ pre-script `python/0_esp32_common.py`.
 
 ## 4. Терминал
 
-Команды регистрируются модулем лениво при первом вызове `TerminalLoop()`:
+Команды регистрируются в `begin()` через `TerminalRegisterModule("module_macros", "macro", ...)`
+(единый контракт модулей; ленивой регистрации из `TerminalLoop()` больше нет):
 
 ```
 macro list                         — список сценариев и число обработчиков
